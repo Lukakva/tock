@@ -86,6 +86,7 @@ members = [
     "libraries/tock-cells",
     "libraries/tock-register-interface",
     "libraries/tickv",
+    "libraries/embedded-sdmmc-rs",
 ]
 exclude = ["tools/"]
 
