@@ -2,6 +2,7 @@
 //!
 //! Generic code for handling block devices.
 
+use super::super::fs::FatVolume;
 use kernel::ErrorCode;
 
 /// Represents a standard 512 byte block (also known as a sector). IBM PC
@@ -50,24 +51,6 @@ pub trait AsyncBlockDevice<'a> {
 pub trait AsyncBlockDeviceClient {
     fn read_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>);
     fn write_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>);
-}
-
-/// Represents a block device - a device which can read and write blocks (or
-/// sectors). Only supports devices which are <= 2 TiB in size.
-pub trait BlockDevice {
-    /// The errors that the `BlockDevice` can return. Must be debug formattable.
-    type Error: core::fmt::Debug;
-    /// Read one or more blocks, starting at the given block index.
-    fn read(
-        &self,
-        block: &mut [u8; 512],
-        block_idx: BlockIdx,
-        reason: &str,
-    ) -> Result<(), Self::Error>;
-    /// Write one or more blocks, starting at the given block index.
-    fn write(&self, block: &[u8; 512], block_idx: BlockIdx) -> Result<(), Self::Error>;
-    /// Determine how many blocks this device can hold.
-    fn num_blocks(&self) -> Result<BlockCount, Self::Error>;
 }
 
 impl Block {
@@ -225,6 +208,110 @@ impl core::iter::Iterator for BlockIter {
         }
     }
 }
+
+/// Represents all the ways the functions in this crate can fail.
+#[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
+#[derive(Debug, Clone)]
+pub enum Error {
+    /// The underlying block device threw an error.
+    DeviceError,
+    /// Device is busy.
+    DeviceBusy,
+    /// The filesystem is badly formatted (or this code is buggy).
+    FormatError,
+    /// The given `VolumeIdx` was bad,
+    NoSuchVolume,
+    /// The given filename was bad
+    FilenameError,
+    /// Out of memory opening directories
+    TooManyOpenDirs,
+    /// Out of memory opening files
+    TooManyOpenFiles,
+    /// That file doesn't exist
+    FileNotFound,
+    /// You can't open a file twice
+    FileAlreadyOpen,
+    /// You can't open a directory twice
+    DirAlreadyOpen,
+    /// You can't open a directory as a file
+    OpenedDirAsFile,
+    /// You can't delete a directory as a file
+    DeleteDirAsFile,
+    /// You can't delete an open file
+    FileIsOpen,
+    /// We can't do that yet
+    Unsupported,
+    /// Tried to read beyond end of file
+    EndOfFile,
+    /// Found a bad cluster
+    BadCluster,
+    /// Error while converting types
+    ConversionError,
+    /// The device does not have enough space for the operation
+    NotEnoughSpace,
+    /// Cluster was not properly allocated by the library
+    AllocationError,
+    /// Jumped to free space during fat traversing
+    JumpedFree,
+    /// Tried to open Read-Only file with write mode
+    ReadOnly,
+    /// Tried to create an existing file
+    FileAlreadyExists,
+    /// Bad block size - only 512 byte blocks supported
+    BadBlockSize(u16),
+    /// Entry not found in the block
+    NotInBlock,
+}
+
+/// Represents a partition with a filesystem within it.
+#[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq)]
+pub struct Volume {
+    pub(crate) idx: VolumeIdx,
+    pub(crate) volume_type: VolumeType,
+}
+
+/// This enum holds the data for the various different types of filesystems we
+/// support.
+#[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum VolumeType {
+    /// FAT16/FAT32 formatted volumes.
+    Fat(FatVolume),
+}
+
+/// A `VolumeIdx` is a number which identifies a volume (or partition) on a
+/// disk. `VolumeIdx(0)` is the first primary partition on an MBR partitioned
+/// disk.
+#[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub struct VolumeIdx(pub usize);
+
+// ****************************************************************************
+//
+// Public Data
+//
+// ****************************************************************************
+
+// None
+
+// ****************************************************************************
+//
+// Private Types
+//
+// ****************************************************************************
+
+/// Marker for a FAT32 partition. Sometimes also use for FAT16 formatted
+/// partitions.
+pub const PARTITION_ID_FAT32_LBA: u8 = 0x0C;
+/// Marker for a FAT16 partition with LBA. Seen on a Raspberry Pi SD card.
+pub const PARTITION_ID_FAT16_LBA: u8 = 0x0E;
+/// Marker for a FAT16 partition. Seen on a card formatted with the official
+/// SD-Card formatter.
+pub const PARTITION_ID_FAT16: u8 = 0x06;
+/// Marker for a FAT32 partition. What Macosx disk utility (and also SD-Card formatter?)
+/// use.
+pub const PARTITION_ID_FAT32_CHS_LBA: u8 = 0x0B;
 
 // ****************************************************************************
 //

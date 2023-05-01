@@ -1,2 +1,6 @@
+#[macro_use]
+pub mod structure;
 pub mod driver;
-pub mod fat;
+pub mod fatfs;
+pub mod fs;
+pub mod utils;

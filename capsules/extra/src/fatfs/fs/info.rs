@@ -1,4 +1,4 @@
-use super::super::{BlockCount, BlockIdx, Cluster};
+use crate::fatfs::utils::{BlockCount, BlockIdx, Cluster};
 use byteorder::{ByteOrder, LittleEndian};
 
 /// Indentifies the supported types of FAT format

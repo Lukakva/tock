@@ -5,20 +5,43 @@
 //! Provides a FAT32/FAT16 filesystem driver.
 //!
 //! Currently the driver can only serve one item
-use crate::fatfs::fat::{Controller, Directory, File, TimeSource, Volume};
+use byteorder::{ByteOrder, LittleEndian};
+use core::cell::Cell;
+use core::convert::TryFrom;
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
-use kernel::processbuffer::ReadableProcessBuffer;
 use kernel::syscall::{CommandReturn, SyscallDriver};
-use kernel::utilities::cells::{MapCell, OptionalCell, TakeCell};
+use kernel::utilities::cells::{MapCell, OptionalCell};
 use kernel::{ErrorCode, ProcessId};
 
-use super::fat::blockdevice::AsyncBlockDevice;
-use super::fat::ControllerClient;
+use super::fatfs::FatFs;
+use super::utils::{AsyncBlockDevice, Directory, File, TimeSource, Volume, VolumeIdx};
 
 /// Syscall driver number.
 pub const DRIVER_NUM: usize = capsules_core::driver::NUM::FatFS as usize;
 
-pub const BLOCK_SIZE: usize = 512;
+/// Can only serve 1 entity at a time (process, another driver).
+pub struct FatFsDriver<'a, T: TimeSource> {
+    grants: Grant<
+        App,
+        UpcallCount<1>,
+        AllowRoCount<{ ro_allow::COUNT }>,
+        AllowRwCount<{ rw_allow::COUNT }>,
+    >,
+    fatfs: &'a FatFs<'a, T, 8, 8>,
+
+    // Values below keep track of userspace requests and are not part of
+    // initializing the driver, therefore they are optional.
+    /// The current volume (partition) the driver is working in.
+    volume: MapCell<Volume>,
+    /// Directory Descriptor table. Every directory opened by the user process
+    /// has a corresponding int ID.
+    directories: [OptionalCell<Directory>; 8],
+    /// File Descriptor table. Every file opened by the user process
+    /// has a corresponding int ID.
+    files: [OptionalCell<File>; 8],
+    /// The process that reserved the driver.
+    current_process: OptionalCell<ProcessId>,
+}
 
 /// Ids for read-only allow buffers
 mod ro_allow {
@@ -61,48 +84,10 @@ mod cmd {
 #[derive(Default)]
 struct App;
 
-const MAX_DIRS: usize = 8;
-const MAX_FILES: usize = 8;
+/// Stores the last state that the controller was in, before an async
+/// call was made to read a block from the underlying device.
 
-pub enum CurrentAsyncOperation {
-    // The file system is not doing anything. Not waiting for any responses
-    // from the block device.
-    None,
-    Waiting,
-}
-
-/// A Fat file system, mounted on top of some `AsyncBlockDevice`.
-/// Can only serve 1 entity at a time (process, another driver).
-pub struct FatFs<D: AsyncBlockDevice<'static> + 'static, T: TimeSource + 'static> {
-    grants: Grant<
-        App,
-        UpcallCount<1>,
-        AllowRoCount<{ ro_allow::COUNT }>,
-        AllowRwCount<{ rw_allow::COUNT }>,
-    >,
-    controller: TakeCell<'static, Controller<'static, D, T, MAX_DIRS, MAX_FILES>>,
-
-    filename_buffer: TakeCell<'static, str>,
-
-    // Values below keep track of userspace requests and are not part of
-    // initializing the driver, therefore they are optional.
-    /// The current volume (partition) the driver is working in.
-    volume: MapCell<Volume>,
-    /// Directory Descriptor table. Every directory opened by the user process
-    /// has a corresponding int ID.
-    directories: [OptionalCell<Directory>; MAX_DIRS],
-    /// File Descriptor table. Every file opened by the user process
-    /// has a corresponding int ID.
-    files: [OptionalCell<File>; MAX_FILES],
-    /// The process that reserved the driver.
-    current_process: OptionalCell<ProcessId>,
-}
-
-impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> ControllerClient for FatFs<D, T> {
-    fn on_get_volume_done(&self, result: Result<Volume, super::fat::Error>) {}
-}
-
-impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> FatFs<D, T> {
+impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
     /// Checks if the process making the syscall has the ability to do so.
     /// Returns Ok() iff the process making the syscall is the one which reserved the driver.
     /// Returns Fail(ErrorCode::RESERVE) if no process has reserved the driver,
@@ -162,16 +147,16 @@ impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> FatFs<D, T> {
                 ErrorCode::RESERVE => {
                     // No process has a reservation.
                     self.controller
-                        .map(
-                            |controller| match controller.get_volume(partition_index as u32) {
-                                Ok(volume) => {
+                        .map(|controller| {
+                            // Starts the retrieval of the first block to retrieve the correct partition.
+                            match controller.get_volume(VolumeIdx(partition_index as usize)) {
+                                Ok(_) => {
                                     self.current_process.replace(process_id);
-                                    self.volume.replace(volume);
                                     Ok(())
                                 }
-                                Err(_err) => Err(ErrorCode::FAIL),
-                            },
-                        )
+                                Err(err) => Err(err),
+                            }
+                        })
                         .unwrap_or(Err(ErrorCode::FAIL))
                 }
                 // Should never happen.
@@ -181,7 +166,7 @@ impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> FatFs<D, T> {
     }
 
     /// Opens the root directory and stores it in directory descriptor 0.
-    fn syscall_open_root_dir(&self, process_id: ProcessId) -> Result<u32, ErrorCode> {
+    fn syscall_open_root_dir(&self, process_id: ProcessId) -> Result<(), ErrorCode> {
         // If directory descriptor 0 is already taken, it's root.
         if self.directories[0].is_some() {
             return Err(ErrorCode::ALREADY);
@@ -193,9 +178,15 @@ impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> FatFs<D, T> {
                 .map(|controller| match controller.open_root_dir(&volume) {
                     Ok(root_directory) => {
                         self.directories[0].replace(root_directory);
-                        // Convention is to send back the file/dir descriptor (int)
-                        // of whatever the userspace opened. For root dir it's always 0.
-                        Ok(0)
+
+                        // Schedule an upcall.
+                        self.grants
+                            .enter(process_id, |_, kernel_data| {
+                                // Convention is to send back the file/dir descriptor (int)
+                                // of whatever the userspace opened. For root dir it's always 0.
+                                kernel_data.schedule_upcall(0, (0, 0, 0)).ok();
+                            })
+                            .map_err(|_err| ErrorCode::FAIL)
                     }
                     Err(err) => Err(ErrorCode::FAIL),
                 })
@@ -250,7 +241,7 @@ impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> FatFs<D, T> {
     fn syscall_open_file() {}
 }
 
-impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> SyscallDriver for FatFs<D, T> {
+impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> SyscallDriver for FatFs<'a, T> {
     fn command(
         &self,
         command_num: usize,
@@ -272,11 +263,11 @@ impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> SyscallDriver for FatFs<D,
                 match self.has_reservation(&process_id) {
                     Ok(_) => match command {
                         cmd::OPEN_ROOT_DIR => match self.syscall_open_root_dir(process_id) {
-                            Ok(id) => CommandReturn::success_u32(id),
+                            Ok(_) => CommandReturn::success(),
                             Err(code) => CommandReturn::failure(code),
                         },
                         cmd::OPEN_DIR => match self.syscall_opendir(process_id, r2) {
-                            Ok(id) => CommandReturn::success_u32(id),
+                            Ok(_) => CommandReturn::success(),
                             Err(code) => CommandReturn::failure(code),
                         },
                         _ => CommandReturn::failure(ErrorCode::NOSUPPORT),

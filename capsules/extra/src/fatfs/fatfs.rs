@@ -1,21 +1,27 @@
-use byteorder::{ByteOrder, LittleEndian};
-use core::convert::TryFrom;
+use core::cell::Cell;
 
-#[cfg(feature = "log")]
-use log::debug;
+use byteorder::LittleEndian;
+use kernel::utilities::cells::OptionalCell;
+use kernel::ErrorCode;
 
-#[cfg(feature = "defmt-log")]
-use defmt::debug;
-
-use super::blockdevice::{AsyncBlockDevice, AsyncBlockDeviceClient};
-use super::fat::{self, RESERVED_ENTRIES};
-use super::filesystem::{
-    Attributes, Cluster, DirEntry, Directory, File, Mode, ShortFileName, TimeSource, MAX_FILE_SIZE,
+use crate::fatfs::{
+    fs::{parse_volume, RESERVED_ENTRIES},
+    utils::{
+        Block, BlockCount, BlockIdx, Error, PARTITION_ID_FAT16, PARTITION_ID_FAT16_LBA,
+        PARTITION_ID_FAT32_CHS_LBA, PARTITION_ID_FAT32_LBA,
+    },
 };
+
 use super::{
-    Block, BlockCount, BlockDevice, BlockIdx, Error, Volume, VolumeIdx, VolumeType,
-    PARTITION_ID_FAT16, PARTITION_ID_FAT16_LBA, PARTITION_ID_FAT32_CHS_LBA, PARTITION_ID_FAT32_LBA,
+    fs::FatType,
+    utils::{
+        AsyncBlockDevice, AsyncBlockDeviceClient, Attributes, Cluster, DirEntry, Directory, File,
+        Mode, ShortFileName, TimeSource, Volume, VolumeIdx, VolumeType, MAX_FILE_SIZE,
+    },
 };
+
+const MAX_DIRS: usize = 8;
+const MAX_FILES: usize = 8;
 
 /// Stores the last state that the controller was in, before an async
 /// call was made to read a block from the underlying device.
@@ -25,45 +31,41 @@ pub enum CurrentAsyncOperation {
     GetVolume { volume_idx: u32 },
 }
 
-pub trait ControllerClient {
+pub trait FatFsClient {
     /// Callback for when the `Controller.get_volume()` operation finishes.
     fn on_get_volume_done(&self, result: Result<Volume, Error>);
 }
 
-/// A `Controller` wraps a block device and gives access to the volumes within it.
-pub struct Controller<'a, D, T, const MAX_DIRS: usize = 4, const MAX_FILES: usize = 4>
+/// A FatFs controller. The main item.
+pub struct FatFs<'a, T, const MAX_DIRS: usize = 4, const MAX_FILES: usize = 4>
 where
-    D: AsyncBlockDevice<'a>,
     T: TimeSource,
 {
-    state: CurrentAsyncOperation,
+    client: OptionalCell<&'static dyn FatFsClient>,
+    state: Cell<CurrentAsyncOperation>,
     buffer: &'static mut [u8; 512],
-    client: &'a dyn ControllerClient,
-    pub(crate) block_device: D,
+    pub(crate) block_device: &'a dyn AsyncBlockDevice<'a>,
     pub(crate) timesource: T,
     open_dirs: [(VolumeIdx, Cluster); MAX_DIRS],
     open_files: [(VolumeIdx, Cluster); MAX_FILES],
 }
 
-impl<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>
-    Controller<'a, D, T, MAX_DIRS, MAX_FILES>
+impl<'a, T, const MAX_DIRS: usize, const MAX_FILES: usize> FatFs<'a, T, MAX_DIRS, MAX_FILES>
 where
-    D: AsyncBlockDevice<'a>,
     T: TimeSource,
 {
     /// Create a new Disk Controller using a generic `BlockDevice`. From this
     /// controller we can open volumes (partitions) and with those we can open
     /// files.
     pub fn new(
-        block_device: D,
+        block_device: &'a dyn AsyncBlockDevice<'a>,
         timesource: T,
-        client: &'a dyn ControllerClient,
         buffer: &'a mut [u8; 512],
-    ) -> Controller<'a, D, T, MAX_DIRS, MAX_FILES> {
-        Controller {
-            state: CurrentAsyncOperation::Idle,
+    ) -> FatFs<'a, T, MAX_DIRS, MAX_FILES> {
+        FatFs {
+            state: Cell::new(CurrentAsyncOperation::Idle),
             buffer,
-            client,
+            client: OptionalCell::default(),
             block_device,
             timesource,
             open_dirs: [(VolumeIdx(0), Cluster::INVALID); MAX_DIRS],
@@ -77,9 +79,9 @@ where
     }
 
     /// Starts the retrieval process of a volume.
-    pub fn get_volume(&mut self, volume_idx: VolumeIdx) -> Result<(), Error> {
+    pub fn get_volume(&mut self, volume_idx: VolumeIdx) -> Result<(), ErrorCode> {
         if self.state != CurrentAsyncOperation::Idle {
-            return Err(Error::DeviceBusy);
+            return Err(ErrorCode::BUSY);
         }
 
         self.state = CurrentAsyncOperation::GetVolume {
@@ -108,7 +110,7 @@ where
             // We only support Master Boot Record (MBR) partitioned cards, not
             // GUID Partition Table (GPT)
             if LittleEndian::read_u16(&block[FOOTER_START..FOOTER_START + 2]) != FOOTER_VALUE {
-                return Err(Error::FormatError("Invalid MBR signature"));
+                return Err(Error::FormatError);
             }
 
             let partition = match volume_idx {
@@ -130,7 +132,7 @@ where
             };
             // Only 0x80 and 0x00 are valid (bootable, and non-bootable)
             if (partition[PARTITION_INFO_STATUS_INDEX] & 0x7F) != 0x00 {
-                return Err(Error::FormatError("Invalid partition status"));
+                return Err(Error::FormatError);
             }
             let lba_start = LittleEndian::read_u32(
                 &partition[PARTITION_INFO_LBA_START_INDEX..(PARTITION_INFO_LBA_START_INDEX + 4)],
@@ -149,13 +151,13 @@ where
             | PARTITION_ID_FAT32_LBA
             | PARTITION_ID_FAT16_LBA
             | PARTITION_ID_FAT16 => {
-                let volume = fat::parse_volume(self, lba_start, num_blocks)?;
+                let volume = parse_volume(self, lba_start, num_blocks)?;
                 Ok(Volume {
                     idx: volume_idx,
                     volume_type: volume,
                 })
             }
-            _ => Err(Error::FormatError("Partition type not supported")),
+            _ => Err(Error::FormatError),
         }
     }
 
@@ -455,7 +457,7 @@ where
         buffer: &mut [u8],
     ) -> Result<usize, Error> {
         // Calculate which file block the current offset lies within
-        // While there is more to read, read the block and copy in to the buffer.
+        // While there is more to rearead the block and copy in to the buffer.
         // If we need to find the next cluster, walk the FAT.
         let mut space = buffer.len();
         let mut read = 0;
@@ -588,7 +590,7 @@ where
     }
 
     /// Consume self and return BlockDevice and TimeSource
-    pub fn free(self) -> (D, T) {
+    pub fn free(self) -> (T) {
         (self.block_device, self.timesource)
     }
 
@@ -626,11 +628,7 @@ where
     }
 
     /// Writes a Directory Entry to the disk
-    fn write_entry_to_disk(
-        &mut self,
-        fat_type: fat::FatType,
-        entry: &DirEntry,
-    ) -> Result<(), Error> {
+    fn write_entry_to_disk(self, fat_type: FatType, entry: &DirEntry) -> Result<(), Error> {
         let mut blocks = [Block::new()];
         self.block_device
             .read(&mut blocks, entry.entry_block, "read")?;
@@ -644,10 +642,9 @@ where
     }
 }
 
-impl<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize> AsyncBlockDeviceClient
-    for Controller<'a, D, T, MAX_DIRS, MAX_FILES>
+impl<'a, T, const MAX_DIRS: usize, const MAX_FILES: usize> AsyncBlockDeviceClient
+    for FatFs<'a, T, MAX_DIRS, MAX_FILES>
 where
-    D: AsyncBlockDevice<'a>,
     T: TimeSource,
 {
     fn read_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>) {

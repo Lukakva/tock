@@ -1,4 +1,4 @@
-use super::super::filesystem::{Cluster, DirEntry};
+use super::super::utils::{Cluster, DirEntry};
 
 /// Represents an open file on disk.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]

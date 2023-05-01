@@ -8,14 +8,16 @@ pub const MAX_FILE_SIZE: u32 = core::u32::MAX;
 
 mod attributes;
 mod cluster;
+mod data_structures;
 mod directory;
 mod filename;
 mod files;
 mod timestamp;
 
-pub use self::attributes::Attributes;
-pub use self::cluster::Cluster;
-pub use self::directory::{DirEntry, Directory};
-pub use self::filename::{FilenameError, ShortFileName};
-pub use self::files::{File, FileError, Mode};
-pub use self::timestamp::{TimeSource, Timestamp};
+pub use self::attributes::*;
+pub use self::cluster::*;
+pub use self::data_structures::*;
+pub use self::directory::*;
+pub use self::filename::*;
+pub use self::files::*;
+pub use self::timestamp::*;

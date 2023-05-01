@@ -6,18 +6,20 @@ use log::{debug, trace, warn};
 #[cfg(feature = "defmt-log")]
 use defmt::{debug, trace, warn};
 
-use crate::fatfs::fat::{blockdevice::AsyncBlockDevice, ControllerClient};
-
-use super::super::{
-    fat::{
-        Bpb, Fat16Info, Fat32Info, FatSpecificInfo, FatType, InfoSector, OnDiskDirEntry,
-        RESERVED_ENTRIES,
+use crate::fatfs::{
+    fatfs::FatFs,
+    utils::{
+        AsyncBlockDevice, Attributes, Block, BlockCount, BlockIdx, Cluster, DirEntry, Directory,
+        Error, ShortFileName, TimeSource, VolumeType,
     },
-    Attributes, Block, BlockCount, BlockDevice, BlockIdx, Cluster, Controller, DirEntry, Directory,
-    Error, ShortFileName, TimeSource, VolumeType,
 };
 use byteorder::{ByteOrder, LittleEndian};
 use core::convert::TryFrom;
+
+use super::{
+    Bpb, Fat16Info, Fat32Info, FatSpecificInfo, FatType, InfoSector, OnDiskDirEntry,
+    RESERVED_ENTRIES,
+};
 
 /// The name given to a particular FAT formatted volume.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
@@ -72,7 +74,7 @@ impl FatVolume {
     /// Write a new entry in the FAT
     pub fn update_info_sector<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &mut self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
     ) -> Result<(), Error>
     where
         D: AsyncBlockDevice<'a>,
@@ -116,7 +118,7 @@ impl FatVolume {
     /// Write a new entry in the FAT
     fn update_fat<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &mut self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         cluster: Cluster,
         new_value: Cluster,
     ) -> Result<(), Error>
@@ -177,7 +179,7 @@ impl FatVolume {
     /// Look in the FAT to see which cluster comes next.
     pub(crate) fn next_cluster<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &self,
-        controller: &Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         cluster: Cluster,
     ) -> Result<Cluster, Error>
     where
@@ -284,12 +286,11 @@ impl FatVolume {
         'a,
         D,
         T,
-        C,
         const MAX_DIRS: usize,
         const MAX_FILES: usize,
     >(
         &mut self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         dir: &Directory,
         name: ShortFileName,
         attributes: Attributes,
@@ -418,7 +419,7 @@ impl FatVolume {
     /// Useful for performing directory listings.
     pub(crate) fn iterate_dir<'a, D, T, F, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &self,
-        controller: &Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         dir: &Directory,
         mut func: F,
     ) -> Result<(), Error>
@@ -516,7 +517,7 @@ impl FatVolume {
     /// Get an entry from the given directory
     pub(crate) fn find_directory_entry<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         dir: &Directory,
         name: &str,
     ) -> Result<DirEntry, Error>
@@ -597,7 +598,7 @@ impl FatVolume {
     /// Finds an entry in a given block
     fn find_entry_in_block<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         fat_type: FatType,
         match_name: &ShortFileName,
         block: BlockIdx,
@@ -628,16 +629,9 @@ impl FatVolume {
     }
 
     /// Delete an entry from the given directory
-    pub(crate) fn delete_directory_entry<
-        'a,
-        D,
-        T,
-        C,
-        const MAX_DIRS: usize,
-        const MAX_FILES: usize,
-    >(
+    pub(crate) fn delete_directory_entry<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         dir: &Directory,
         name: &str,
     ) -> Result<(), Error>
@@ -708,7 +702,7 @@ impl FatVolume {
     /// Deletes an entry in a given block
     fn delete_entry_in_block<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         match_name: &ShortFileName,
         block: BlockIdx,
     ) -> Result<(), Error>
@@ -738,16 +732,9 @@ impl FatVolume {
     }
 
     /// Finds the next free cluster after the start_cluster and before end_cluster
-    pub(crate) fn find_next_free_cluster<
-        'a,
-        D,
-        T,
-        C,
-        const MAX_DIRS: usize,
-        const MAX_FILES: usize,
-    >(
+    pub(crate) fn find_next_free_cluster<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         start_cluster: Cluster,
         end_cluster: Cluster,
     ) -> Result<Cluster, Error>
@@ -815,7 +802,7 @@ impl FatVolume {
     /// Tries to allocate a cluster
     pub(crate) fn alloc_cluster<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &mut self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         prev_cluster: Option<Cluster>,
         zero: bool,
     ) -> Result<Cluster, Error>
@@ -870,16 +857,9 @@ impl FatVolume {
     }
 
     /// Marks the input cluster as an EOF and all the subsequent clusters in the chain as free
-    pub(crate) fn truncate_cluster_chain<
-        'a,
-        D,
-        T,
-        C,
-        const MAX_DIRS: usize,
-        const MAX_FILES: usize,
-    >(
+    pub(crate) fn truncate_cluster_chain<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
         &mut self,
-        controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+        controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
         cluster: Cluster,
     ) -> Result<(), Error>
     where
@@ -926,7 +906,7 @@ impl FatVolume {
 /// Load the boot parameter block from the start of the given partition and
 /// determine if the partition contains a valid FAT16 or FAT32 file system.
 pub fn parse_volume<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize>(
-    controller: &mut Controller<'a, D, T, MAX_DIRS, MAX_FILES>,
+    controller: &mut FatFs<'a, D, T, MAX_DIRS, MAX_FILES>,
     lba_start: BlockIdx,
     num_blocks: BlockCount,
 ) -> Result<VolumeType, Error>
