@@ -7,17 +7,20 @@
 //! Currently the driver can only serve one item
 
 use core::cell::Cell;
+use core::cmp;
 use core::marker::PhantomData;
 
 use crate::fatfs::fat::{BlockDevice, Controller, Directory, File, TimeSource, Volume, VolumeIdx};
-use capsules_core::process_console::Command;
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
-use kernel::hil;
-use kernel::process::Process;
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{MapCell, OptionalCell, TakeCell};
-use kernel::{ErrorCode, ProcessId};
+use kernel::{
+    ErrorCode::{self, FAIL, INVAL, RESERVE},
+    ProcessId,
+};
+
+use super::fat::Mode;
 
 /// Syscall driver number.
 pub const DRIVER_NUM: usize = capsules_core::driver::NUM::FatFS as usize;
@@ -65,6 +68,7 @@ struct App;
 
 const MAX_DIRS: usize = 8;
 const MAX_FILES: usize = 8;
+pub const FILENAME_BUFFER: [u8; 11] = [0; 11];
 
 /// Struct that stores the state of the Fat32 driver.
 /// Stores information about the current process that the driver is serving.
@@ -79,7 +83,7 @@ pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
     >,
     controller: TakeCell<'static, Controller<D, T, MAX_DIRS, MAX_FILES>>,
 
-    filename_buffer: TakeCell<'static, str>,
+    filename_buffer: TakeCell<'static, [u8]>,
 
     // Values below keep track of userspace requests and are not part of
     // initializing the driver, therefore they are optional.
@@ -87,10 +91,10 @@ pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
     volume: MapCell<Volume>,
     /// Directory Descriptor table. Every directory opened by the user process
     /// has a corresponding int ID.
-    directories: [OptionalCell<Directory>; MAX_DIRS],
+    directories: MapCell<[Option<Directory>; MAX_DIRS]>,
     /// File Descriptor table. Every file opened by the user process
     /// has a corresponding int ID.
-    files: [OptionalCell<File>; MAX_FILES],
+    files: MapCell<[Option<File>; MAX_FILES]>,
     /// The process that reserved the driver.
     current_process: OptionalCell<ProcessId>,
 }
@@ -114,31 +118,23 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
     /// Resets the driver. This is done after a process is done using the driver.
     fn reset(&self) {
         self.current_process.clear();
+        self.volume.take();
 
-        // Maybe the process reserved the driver, but didn't do anything.
-        match self.volume.take() {
-            Some(volume) => {
-                self.controller.map(|controller| {
-                    for dir in self.directories.iter() {
-                        // Using .take().map() allows us to clear the `OptionalCell` and
-                        // at the same time, if there was a directory struct in the cell,
-                        // use the value.
-                        dir.take().map(|dir| {
-                            controller.close_dir(&volume, dir);
-                        });
-                    }
+        self.controller.map(|controller| {
+            self.directories.map(|dirs| {
+                for i in 0..dirs.len() {
+                    dirs[i] = None;
+                }
+            });
 
-                    for file in self.files.iter() {
-                        file.take().map(|file| {
-                            controller.close_file(&volume, file).ok();
-                        });
-                    }
+            self.files.map(|files| {
+                for i in 0..files.len() {
+                    files[i] = None;
+                }
+            });
 
-                    self.current_process.clear();
-                });
-            }
-            None => {}
-        };
+            controller.reset();
+        });
     }
 
     /// Handles the INIT syscall.
@@ -174,30 +170,26 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
     }
 
     /// Opens the root directory and stores it in directory descriptor 0.
-    fn syscall_open_root_dir(&self, process_id: ProcessId) -> Result<u32, ErrorCode> {
-        // If directory descriptor 0 is already taken, it's root.
-        if self.directories[0].is_some() {
-            return Err(ErrorCode::ALREADY);
-        }
+    fn syscall_open_root_dir(&self, _process_id: ProcessId) -> Result<u32, ErrorCode> {
+        self.directories.map_or(Err(ErrorCode::FAIL), |dirs| {
+            // If directory descriptor 0 is already taken, it's root.
+            if dirs[0].is_some() {
+                return Err(ErrorCode::ALREADY);
+            }
 
-        self.volume.take().map_or(Err(ErrorCode::FAIL), |volume| {
-            let result = self
-                .controller
-                .map(|controller| match controller.open_root_dir(&volume) {
-                    Ok(root_directory) => {
-                        self.directories[0].replace(root_directory);
-                        // Convention is to send back the file/dir descriptor (int)
-                        // of whatever the userspace opened. For root dir it's always 0.
-                        Ok(0)
+            self.volume.map_or(Err(ErrorCode::FAIL), |volume| {
+                self.controller.map_or(Err(ErrorCode::FAIL), |controller| {
+                    match controller.open_root_dir(&volume) {
+                        Ok(root_directory) => {
+                            dirs[0] = Some(root_directory);
+                            // Convention is to send back the file/dir descriptor (int)
+                            // of whatever the userspace opened. For root dir it's always 0.
+                            Ok(0)
+                        }
+                        Err(_err) => Err(ErrorCode::FAIL),
                     }
-                    Err(err) => Err(ErrorCode::FAIL),
                 })
-                .unwrap_or(Err(ErrorCode::FAIL));
-
-            // Put back the volume struct.
-            self.volume.replace(volume);
-
-            return result;
+            })
         })
     }
 
@@ -207,40 +199,167 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
         process_id: ProcessId,
         parent_dir_id: usize,
     ) -> Result<u32, ErrorCode> {
-        // Below is the unpacking hell. Essentially this code, in a safe manner
-        // 1. Ensures the directory ID given by the process is valid.
-        // 2. Retrieves the controller.
-        // 3. Retrieves the current volume the process is working with.
-        // 4. Retrieves the string slice from the user process that contains
-        // the name of the dir.
-        self.directories
-            .get(parent_dir_id)
-            .map_or(Err(ErrorCode::INVAL), |cell| {
-                cell.take().map_or(Err(ErrorCode::INVAL), |parent_dir| {
-                    self.controller.map_or(Err(ErrorCode::FAIL), |controller| {
-                        self.volume.take().map_or(Err(ErrorCode::FAIL), |volume| {
+        // Below is the unpacking hell.
+        // We need to have access to:
+        // - directories
+        // - controller
+        // - current partition (volume)
+        // - the local filename buffer
+        // - userspace filename buffer
+        // and then we can finally perform the logic.
+        self.directories.map_or(Err(INVAL), |dirs| {
+            self.controller.map_or(Err(INVAL), |controller| {
+                self.volume.map_or(Err(FAIL), |volume| {
+                    self.filename_buffer.map_or(Err(FAIL), |name| {
+                        // Retrieve the file name from userspace.
+                        self.grants
+                            .enter(process_id, |_, kd| {
+                                kd.get_readonly_processbuffer(ro_allow::FILE_NAME)
+                                    .and_then(|data| {
+                                        data.enter(|data| {
+                                            // Check if the dir exists.
+                                            let parent_dir = match dirs.get(parent_dir_id) {
+                                                Some(cell) => match cell {
+                                                    Some(dir) => Ok(dir),
+                                                    None => Err(INVAL),
+                                                },
+                                                None => Err(INVAL),
+                                            }?; // Note the ? operator.
+
+                                            // Find the next free directory descriptor.
+                                            let new_dir_id = {
+                                                let mut i = 0;
+                                                loop {
+                                                    if i >= dirs.len() {
+                                                        break Err(ErrorCode::NOMEM);
+                                                    }
+                                                    if dirs[i].is_none() {
+                                                        break Ok(i);
+                                                    }
+                                                    i += 1;
+                                                }
+                                            }?; // Note the ? operator.
+
+                                            // Copy the filename from the userspace.
+                                            // Make sure we don't go over the userspace buffer,
+                                            // as well as our local buffer.
+                                            for (i, byte) in data.iter().enumerate() {
+                                                if i >= name.len() {
+                                                    break;
+                                                }
+
+                                                name[i] = byte.get();
+                                            }
+
+                                            match controller.open_dir(volume, parent_dir, name) {
+                                                Ok(directory) => {
+                                                    dirs[new_dir_id] = Some(directory);
+                                                    Ok(new_dir_id as u32)
+                                                }
+                                                Err(_err) => Err(INVAL),
+                                            }
+                                        })
+                                    })
+                                    .unwrap_or(Err(FAIL))
+                            })
+                            .unwrap_or(Err(RESERVE))
+                    })
+                })
+            })
+        })
+    }
+
+    /// Handles the OPEN_FILE syscall.
+    fn syscall_open_file(
+        &self,
+        process_id: ProcessId,
+        parent_dir_id: usize,
+        mode: usize,
+    ) -> Result<u32, ErrorCode> {
+        // Below is the unpacking hell.
+        // We need to have access to:
+        // - directories
+        // - files
+        // - controller
+        // - current partition (volume)
+        // - the local filename buffer
+        // - userspace filename buffer
+        // and then we can finally perform the logic.
+        self.directories.map_or(Err(INVAL), |dirs| {
+            self.files.map_or(Err(INVAL), |files| {
+                self.controller.map_or(Err(INVAL), |controller| {
+                    self.volume.map_or(Err(FAIL), |volume| {
+                        self.filename_buffer.map_or(Err(FAIL), |name| {
                             // Retrieve the file name from userspace.
-                            let name = self.grants.enter(process_id, |app_data, kernel_data| {
-                                // kernel_data.get_readonly_processbuffer(ro_allow::FILE_NAME)
-                                // .and_then(|data| data.enter(|data| data.cop))
-                            });
+                            self.grants
+                                .enter(process_id, |_, kd| {
+                                    kd.get_readonly_processbuffer(ro_allow::FILE_NAME)
+                                        .and_then(|data| {
+                                            data.enter(|data| {
+                                                // Check if the dir exists.
+                                                let parent_dir = match dirs.get(parent_dir_id) {
+                                                    Some(cell) => match cell {
+                                                        Some(dir) => Ok(dir),
+                                                        None => Err(INVAL),
+                                                    },
+                                                    None => Err(INVAL),
+                                                }?; // Note the ? operator.
 
-                            let result = match controller.open_dir(&volume, &parent_dir, "asd") {
-                                Ok(res) => Ok(1),
-                                Err(err) => Err(ErrorCode::INVAL),
-                            };
+                                                // Find the next free file descriptor.
+                                                let new_file_id = {
+                                                    let mut i = 0;
+                                                    loop {
+                                                        if i >= files.len() {
+                                                            break Err(ErrorCode::NOMEM);
+                                                        }
+                                                        if files[i].is_none() {
+                                                            break Ok(i);
+                                                        }
+                                                        i += 1;
+                                                    }
+                                                }?; // Note the ? operator.
 
-                            // Put back
-                            self.volume.replace(volume);
-                            result
+                                                // Copy the filename from the userspace.
+                                                // Make sure we don't go over the userspace buffer,
+                                                // as well as our local buffer.
+                                                for (i, byte) in data.iter().enumerate() {
+                                                    if i >= name.len() {
+                                                        break;
+                                                    }
+
+                                                    name[i] = byte.get();
+                                                }
+
+                                                let mode_enum = match mode {
+                                                    0 => Ok(Mode::ReadOnly),
+                                                    1 => Ok(Mode::ReadWriteAppend),
+                                                    2 => Ok(Mode::ReadWriteTruncate),
+                                                    3 => Ok(Mode::ReadWriteCreate),
+                                                    4 => Ok(Mode::ReadWriteCreateOrTruncate),
+                                                    5 => Ok(Mode::ReadWriteCreateOrAppend),
+                                                    _ => Err(ErrorCode::INVAL),
+                                                }?;
+
+                                                match controller.open_file_in_dir(
+                                                    volume, parent_dir, name, mode_enum,
+                                                ) {
+                                                    Ok(file) => {
+                                                        files[new_file_id] = Some(file);
+                                                        Ok(new_file_id as u32)
+                                                    }
+                                                    Err(_err) => Err(INVAL),
+                                                }
+                                            })
+                                        })
+                                        .unwrap_or(Err(FAIL))
+                                })
+                                .unwrap_or(Err(RESERVE))
                         })
                     })
                 })
             })
+        })
     }
-
-    /// Handles the OPEN_FILE syscall.
-    fn syscall_open_file() {}
 }
 
 impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
@@ -259,16 +378,20 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
                 Ok(_) => CommandReturn::success(),
                 Err(code) => CommandReturn::failure(code),
             },
-            command => {
+            cmd::OPEN_DIR | cmd::OPEN_ROOT_DIR | cmd::OPEN_FILE | cmd::DONE => {
                 // Otherwise, for any other syscall, there needs to be a reservation
                 // made by the process.
                 match self.has_reservation(&process_id) {
-                    Ok(_) => match command {
+                    Ok(_) => match command_num {
                         cmd::OPEN_ROOT_DIR => match self.syscall_open_root_dir(process_id) {
                             Ok(id) => CommandReturn::success_u32(id),
                             Err(code) => CommandReturn::failure(code),
                         },
                         cmd::OPEN_DIR => match self.syscall_opendir(process_id, r2) {
+                            Ok(id) => CommandReturn::success_u32(id),
+                            Err(code) => CommandReturn::failure(code),
+                        },
+                        cmd::OPEN_FILE => match self.syscall_open_file(process_id, r2, r3) {
                             Ok(id) => CommandReturn::success_u32(id),
                             Err(code) => CommandReturn::failure(code),
                         },

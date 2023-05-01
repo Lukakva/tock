@@ -68,6 +68,16 @@ where
         }
     }
 
+    pub fn reset(&mut self) {
+        for i in 0..self.open_dirs.len() {
+            self.open_dirs[i] = (VolumeIdx(0), Cluster::INVALID);
+        }
+
+        for i in 0..self.open_files.len() {
+            self.open_files[i] = (VolumeIdx(0), Cluster::INVALID);
+        }
+    }
+
     /// Temporarily get access to the underlying block device.
     pub fn device(&mut self) -> &mut D {
         &mut self.block_device
@@ -190,7 +200,7 @@ where
         &mut self,
         volume: &Volume,
         parent_dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<Directory, Error<D::Error>> {
         // Find a free open directory table row
         let mut open_dirs_row = None;
@@ -242,7 +252,7 @@ where
         &mut self,
         volume: &Volume,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<DirEntry, Error<D::Error>> {
         match &volume.volume_type {
             VolumeType::Fat(fat) => fat.find_directory_entry(self, dir, name),
@@ -345,7 +355,7 @@ where
         &mut self,
         volume: &mut Volume,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
         mode: Mode,
     ) -> Result<File, Error<D::Error>> {
         let dir_entry = match &volume.volume_type {
@@ -373,7 +383,7 @@ where
                     return Err(Error::FileAlreadyExists);
                 }
                 let file_name =
-                    ShortFileName::create_from_str(name).map_err(Error::FilenameError)?;
+                    ShortFileName::create_from_buffer(name).map_err(Error::FilenameError)?;
                 let att = Attributes::create_from_fat(0);
                 let entry = match &mut volume.volume_type {
                     VolumeType::Fat(fat) => {
@@ -420,7 +430,7 @@ where
         &mut self,
         volume: &Volume,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<(), Error<D::Error>> {
         let dir_entry = match &volume.volume_type {
             VolumeType::Fat(fat) => fat.find_directory_entry(self, dir, name),
@@ -567,7 +577,7 @@ where
     }
 
     /// Close a file with the given full path.
-    pub fn close_file(&mut self, volume: &Volume, file: File) -> Result<(), Error<D::Error>> {
+    pub fn close_file(&mut self, volume: &Volume, file: File) {
         let target = (volume.idx, file.starting_cluster);
         for d in self.open_files.iter_mut() {
             if *d == target {
@@ -576,7 +586,6 @@ where
             }
         }
         drop(file);
-        Ok(())
     }
 
     /// Check if any files or folders are open.

@@ -526,13 +526,13 @@ impl FatVolume {
         &self,
         controller: &mut Controller<D, T, MAX_DIRS, MAX_FILES>,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<DirEntry, Error<D::Error>>
     where
         D: BlockDevice,
         T: TimeSource,
     {
-        let match_name = ShortFileName::create_from_str(name).map_err(Error::FilenameError)?;
+        let match_name = ShortFileName::create_from_buffer(name).map_err(Error::FilenameError)?;
         match &self.fat_specific_info {
             FatSpecificInfo::Fat16(fat16_info) => {
                 let mut current_cluster = Some(dir.cluster);
@@ -641,13 +641,13 @@ impl FatVolume {
         &self,
         controller: &mut Controller<D, T, MAX_DIRS, MAX_FILES>,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<(), Error<D::Error>>
     where
         D: BlockDevice,
         T: TimeSource,
     {
-        let match_name = ShortFileName::create_from_str(name).map_err(Error::FilenameError)?;
+        let match_name = ShortFileName::create_from_buffer(name).map_err(Error::FilenameError)?;
         match &self.fat_specific_info {
             FatSpecificInfo::Fat16(fat16_info) => {
                 let mut current_cluster = Some(dir.cluster);

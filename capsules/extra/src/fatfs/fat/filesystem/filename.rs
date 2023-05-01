@@ -43,13 +43,13 @@ impl ShortFileName {
     }
 
     /// Create a new MS-DOS 8.3 space-padded file name as stored in the directory entry.
-    pub fn create_from_str(name: &str) -> Result<ShortFileName, FilenameError> {
+    pub fn create_from_buffer(name: &[u8]) -> Result<ShortFileName, FilenameError> {
         let mut sfn = ShortFileName {
             contents: [b' '; Self::FILENAME_MAX_LEN],
         };
         let mut idx = 0;
         let mut seen_dot = false;
-        for ch in name.bytes() {
+        for ch in name.iter() {
             match ch {
                 // Microsoft say these are the invalid characters
                 0x00..=0x1F
@@ -83,9 +83,9 @@ impl ShortFileName {
                 _ => {
                     let ch = if (b'a'..=b'z').contains(&ch) {
                         // Uppercase characters only
-                        ch - 32
+                        *ch - 32
                     } else {
-                        ch
+                        *ch
                     };
                     if seen_dot {
                         if (Self::FILENAME_BASE_MAX_LEN..Self::FILENAME_MAX_LEN).contains(&idx) {
@@ -110,13 +110,13 @@ impl ShortFileName {
 
     /// Create a new MS-DOS 8.3 space-padded file name as stored in the directory entry.
     /// Use this for volume labels with mixed case.
-    pub fn create_from_str_mixed_case(name: &str) -> Result<ShortFileName, FilenameError> {
+    pub fn create_from_buffer_mixed_case(name: &[u8]) -> Result<ShortFileName, FilenameError> {
         let mut sfn = ShortFileName {
             contents: [b' '; Self::FILENAME_MAX_LEN],
         };
         let mut idx = 0;
         let mut seen_dot = false;
-        for ch in name.bytes() {
+        for ch in name.iter() {
             match ch {
                 // Microsoft say these are the invalid characters
                 0x00..=0x1F
@@ -150,12 +150,12 @@ impl ShortFileName {
                 _ => {
                     if seen_dot {
                         if (Self::FILENAME_BASE_MAX_LEN..Self::FILENAME_MAX_LEN).contains(&idx) {
-                            sfn.contents[idx] = ch;
+                            sfn.contents[idx] = *ch;
                         } else {
                             return Err(FilenameError::NameTooLong);
                         }
                     } else if idx < Self::FILENAME_BASE_MAX_LEN {
-                        sfn.contents[idx] = ch;
+                        sfn.contents[idx] = *ch;
                     } else {
                         return Err(FilenameError::NameTooLong);
                     }
