@@ -1,7 +1,7 @@
 use core::cell::Cell;
 
-use byteorder::LittleEndian;
-use kernel::utilities::cells::OptionalCell;
+use byteorder::{ByteOrder, LittleEndian};
+use kernel::utilities::cells::{MapCell, OptionalCell};
 use kernel::ErrorCode;
 
 use crate::fatfs::{
@@ -28,7 +28,16 @@ const MAX_FILES: usize = 8;
 #[derive(Debug, PartialEq)]
 pub enum CurrentAsyncOperation {
     Idle,
-    GetVolume { volume_idx: u32 },
+    GetVolume {
+        volume_idx: u32,
+    },
+    // An operation was launched to find the directory entry.
+    // This operation is long since it goes through clusters to find the entry.
+    FindDirectoryEntryFat32 {
+        name: ShortFileName,
+        current_cluster: u32,
+        last_cluster: u32,
+    },
 }
 
 pub trait FatFsClient {
@@ -42,10 +51,14 @@ where
     T: TimeSource,
 {
     client: OptionalCell<&'static dyn FatFsClient>,
-    state: Cell<CurrentAsyncOperation>,
+    state: MapCell<CurrentAsyncOperation>,
     buffer: &'static mut [u8; 512],
     pub(crate) block_device: &'a dyn AsyncBlockDevice<'a>,
     pub(crate) timesource: T,
+    // Values below keep track of userspace requests and are not part of
+    // initializing the driver, therefore they are optional.
+    /// The current volume (partition) the driver is working in.
+    volumes: [Option<Volume>; 4],
     open_dirs: [(VolumeIdx, Cluster); MAX_DIRS],
     open_files: [(VolumeIdx, Cluster); MAX_FILES],
 }
@@ -63,32 +76,30 @@ where
         buffer: &'a mut [u8; 512],
     ) -> FatFs<'a, T, MAX_DIRS, MAX_FILES> {
         FatFs {
-            state: Cell::new(CurrentAsyncOperation::Idle),
+            state: MapCell::empty(),
             buffer,
             client: OptionalCell::default(),
             block_device,
             timesource,
+            volumes: [None, None, None, None],
             open_dirs: [(VolumeIdx(0), Cluster::INVALID); MAX_DIRS],
             open_files: [(VolumeIdx(0), Cluster::INVALID); MAX_FILES],
         }
     }
 
-    /// Temporarily get access to the underlying block device.
-    pub fn device(&mut self) -> &mut D {
-        &mut self.block_device
-    }
-
     /// Starts the retrieval process of a volume.
     pub fn get_volume(&mut self, volume_idx: VolumeIdx) -> Result<(), ErrorCode> {
-        if self.state != CurrentAsyncOperation::Idle {
-            return Err(ErrorCode::BUSY);
-        }
+        self.state.map_or(Err(ErrorCode::FAIL), |state| {
+            if *state != CurrentAsyncOperation::Idle {
+                return Err(ErrorCode::BUSY);
+            }
 
-        self.state = CurrentAsyncOperation::GetVolume {
-            volume_idx: volume_idx.0 as u32,
-        };
+            *state = CurrentAsyncOperation::GetVolume {
+                volume_idx: volume_idx.0 as u32,
+            };
 
-        self.block_device.start_read(self.buffer, 0)
+            self.block_device.start_read(self.buffer, 0)
+        })
     }
 
     /// Actual logic of retrieving the volume, after read is done.
@@ -202,7 +213,7 @@ where
         &mut self,
         volume: &Volume,
         parent_dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<Directory, Error> {
         // Find a free open directory table row
         let mut open_dirs_row = None;
@@ -254,7 +265,7 @@ where
         &mut self,
         volume: &Volume,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<DirEntry, Error> {
         match &volume.volume_type {
             VolumeType::Fat(fat) => fat.find_directory_entry(self, dir, name),
@@ -352,7 +363,7 @@ where
         &mut self,
         volume: &mut Volume,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
         mode: Mode,
     ) -> Result<File, Error> {
         let dir_entry = match &volume.volume_type {
@@ -380,7 +391,7 @@ where
                     return Err(Error::FileAlreadyExists);
                 }
                 let file_name =
-                    ShortFileName::create_from_str(name).map_err(Error::FilenameError)?;
+                    ShortFileName::create_from_buffer(name).map_err(|x| Error::FilenameError)?;
                 let att = Attributes::create_from_fat(0);
                 let entry = match &mut volume.volume_type {
                     VolumeType::Fat(fat) => {
@@ -427,7 +438,7 @@ where
         &mut self,
         volume: &Volume,
         dir: &Directory,
-        name: &str,
+        name: &[u8],
     ) -> Result<(), Error> {
         let dir_entry = match &volume.volume_type {
             VolumeType::Fat(fat) => fat.find_directory_entry(self, dir, name),
@@ -465,7 +476,8 @@ where
             let (block_idx, block_offset, block_avail) =
                 self.find_data_on_disk(volume, &mut file.current_cluster, file.current_offset)?;
             let mut blocks = [Block::new()];
-            self.block_device.read(&mut blocks, block_idx, "read")?;
+            // TODO: ASYNC;
+            // self.block_device.read(&mut blocks, block_idx, "read")?;
             let block = &blocks[0];
             let to_copy = block_avail.min(space).min(file.left() as usize);
             assert!(to_copy != 0);
@@ -543,12 +555,14 @@ where
             let mut blocks = [Block::new()];
             let to_copy = core::cmp::min(block_avail, bytes_to_write - written);
             if block_offset != 0 {
-                self.block_device.read(&mut blocks, block_idx, "read")?;
+                // TODO: ASYNC;
+                // self.block_device.read(&mut blocks, block_idx, "read")?;
             }
             let block = &mut blocks[0];
             block[block_offset..block_offset + to_copy]
                 .copy_from_slice(&buffer[written..written + to_copy]);
-            self.block_device.write(&blocks, block_idx)?;
+            // TODO: ASYNC;
+            // self.block_device.write(&blocks, block_idx)?;
             written += to_copy;
             file.current_cluster = current_cluster;
             let to_copy = i32::try_from(to_copy).map_err(|_| Error::ConversionError)?;
@@ -589,11 +603,6 @@ where
             .all(|(_, c)| c == &Cluster::INVALID)
     }
 
-    /// Consume self and return BlockDevice and TimeSource
-    pub fn free(self) -> (T) {
-        (self.block_device, self.timesource)
-    }
-
     /// This function turns `desired_offset` into an appropriate block to be
     /// read. It either calculates this based on the start of the file, or
     /// from the last cluster we read - whichever is better.
@@ -630,38 +639,17 @@ where
     /// Writes a Directory Entry to the disk
     fn write_entry_to_disk(self, fat_type: FatType, entry: &DirEntry) -> Result<(), Error> {
         let mut blocks = [Block::new()];
-        self.block_device
-            .read(&mut blocks, entry.entry_block, "read")?;
+        // TODO: ASYNC;
+        // self.block_device.read(&mut blocks, entry.entry_block, "")?;
         let block = &mut blocks[0];
 
         let start = usize::try_from(entry.entry_offset).map_err(|_| Error::ConversionError)?;
         block[start..start + 32].copy_from_slice(&entry.serialize(fat_type)[..]);
 
-        self.block_device.write(&blocks, entry.entry_block)?;
+        // TODO: ASYNC;
+        // self.block_device.write(&blocks, entry.entry_block)?;
         Ok(())
     }
-}
-
-impl<'a, T, const MAX_DIRS: usize, const MAX_FILES: usize> AsyncBlockDeviceClient
-    for FatFs<'a, T, MAX_DIRS, MAX_FILES>
-where
-    T: TimeSource,
-{
-    fn read_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>) {
-        match self.state {
-            CurrentAsyncOperation::Idle => {
-                // Read done, but we were not waiting for a read operation?
-            }
-            CurrentAsyncOperation::GetVolume { volume_idx } => {
-                let result = self.get_volume_resume(VolumeIdx(volume_idx as usize));
-                self.state = CurrentAsyncOperation::Idle;
-
-                self.client.on_get_volume_done(result);
-            }
-        }
-    }
-
-    fn write_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>) {}
 }
 
 /// Transform mode variants (ReadWriteCreate_Or_Append) to simple modes ReadWriteAppend or
@@ -682,4 +670,33 @@ fn solve_mode_variant(mode: Mode, dir_entry_is_some: bool) -> Mode {
         }
     }
     mode
+}
+
+impl<'a, T, const MAX_DIRS: usize, const MAX_FILES: usize> AsyncBlockDeviceClient
+    for FatFs<'a, T, MAX_DIRS, MAX_FILES>
+where
+    T: TimeSource,
+{
+    fn read_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>) {
+        self.state.map(|state| {
+            match *state {
+                CurrentAsyncOperation::Idle => {
+                    // Read done, but we were not waiting for a read operation?
+                }
+                CurrentAsyncOperation::GetVolume { volume_idx } => {
+                    let result = self.get_volume_resume(VolumeIdx(volume_idx as usize));
+                    *state = CurrentAsyncOperation::Idle;
+
+                    self.client.map(|client| client.on_get_volume_done(result));
+                }
+                CurrentAsyncOperation::FindDirectoryEntryFat32 {
+                    name,
+                    current_cluster,
+                    last_cluster,
+                } => {}
+            }
+        });
+    }
+
+    fn write_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>) {}
 }

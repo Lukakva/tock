@@ -10,7 +10,7 @@ use core::cell::Cell;
 use core::convert::TryFrom;
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::syscall::{CommandReturn, SyscallDriver};
-use kernel::utilities::cells::{MapCell, OptionalCell};
+use kernel::utilities::cells::{MapCell, OptionalCell, TakeCell};
 use kernel::{ErrorCode, ProcessId};
 
 use super::fatfs::FatFs;
@@ -27,7 +27,7 @@ pub struct FatFsDriver<'a, T: TimeSource> {
         AllowRoCount<{ ro_allow::COUNT }>,
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
-    fatfs: &'a FatFs<'a, T, 8, 8>,
+    fatfs: TakeCell<'a, FatFs<'a, T, 8, 8>>,
 
     // Values below keep track of userspace requests and are not part of
     // initializing the driver, therefore they are optional.
@@ -87,7 +87,7 @@ struct App;
 /// Stores the last state that the controller was in, before an async
 /// call was made to read a block from the underlying device.
 
-impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
+impl<'a, T: TimeSource> FatFsDriver<'a, T> {
     /// Checks if the process making the syscall has the ability to do so.
     /// Returns Ok() iff the process making the syscall is the one which reserved the driver.
     /// Returns Fail(ErrorCode::RESERVE) if no process has reserved the driver,
@@ -110,7 +110,7 @@ impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
         // Maybe the process reserved the driver, but didn't do anything.
         match self.volume.take() {
             Some(volume) => {
-                self.controller.map(|controller| {
+                self.fatfs.map(|controller| {
                     for dir in self.directories.iter() {
                         // Using .take().map() allows us to clear the `OptionalCell` and
                         // at the same time, if there was a directory struct in the cell,
@@ -146,7 +146,7 @@ impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
                 // This error means that no reservation has been made so far, so init can happen.
                 ErrorCode::RESERVE => {
                     // No process has a reservation.
-                    self.controller
+                    self.fatfs
                         .map(|controller| {
                             // Starts the retrieval of the first block to retrieve the correct partition.
                             match controller.get_volume(VolumeIdx(partition_index as usize)) {
@@ -174,8 +174,8 @@ impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
 
         self.volume.take().map_or(Err(ErrorCode::FAIL), |volume| {
             let result = self
-                .controller
-                .map(|controller| match controller.open_root_dir(&volume) {
+                .fatfs
+                .map(|fatfs| match fatfs.open_root_dir(&volume) {
                     Ok(root_directory) => {
                         self.directories[0].replace(root_directory);
 
@@ -215,7 +215,7 @@ impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
             .get(parent_dir_id)
             .map_or(Err(ErrorCode::INVAL), |cell| {
                 cell.take().map_or(Err(ErrorCode::INVAL), |parent_dir| {
-                    self.controller.map_or(Err(ErrorCode::FAIL), |controller| {
+                    self.fatfs.map_or(Err(ErrorCode::FAIL), |fatfs| {
                         self.volume.take().map_or(Err(ErrorCode::FAIL), |volume| {
                             // Retrieve the file name from userspace.
                             let name = self.grants.enter(process_id, |app_data, kernel_data| {
@@ -223,7 +223,7 @@ impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
                                 // .and_then(|data| data.enter(|data| data.cop))
                             });
 
-                            let result = match controller.open_dir(&volume, &parent_dir, "asd") {
+                            let result = match fatfs.open_dir(&volume, &parent_dir, "asd") {
                                 Ok(res) => Ok(1),
                                 Err(err) => Err(ErrorCode::INVAL),
                             };
@@ -241,7 +241,7 @@ impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> FatFsDriver<'a, T> {
     fn syscall_open_file() {}
 }
 
-impl<'a, D: AsyncBlockDevice<'a>, T: TimeSource> SyscallDriver for FatFs<'a, T> {
+impl<'a, T: TimeSource> SyscallDriver for FatFsDriver<'a, T> {
     fn command(
         &self,
         command_num: usize,
