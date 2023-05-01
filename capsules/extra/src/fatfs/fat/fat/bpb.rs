@@ -1,6 +1,6 @@
 //! Boot Parameter Block
 
-use crate::{
+use super::super::{
     blockdevice::{Block, BlockCount},
     fat::{FatType, OnDiskDirEntry},
 };

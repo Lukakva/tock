@@ -14,4 +14,4 @@ enum_primitive = { path = "../../libraries/enum_primitive" }
 tickv = { path = "../../libraries/tickv" }
 capsules-core = { path = "../core" }
 # For Fat32
-embedded-sdmmc = { path = "../../libraries/embedded-sdmmc-rs", default_features = false }
+byteorder = { version = "1", default-features = false }

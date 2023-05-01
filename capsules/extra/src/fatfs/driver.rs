@@ -9,8 +9,8 @@
 use core::cell::Cell;
 use core::marker::PhantomData;
 
+use crate::fatfs::fat::{BlockDevice, Controller, Directory, File, TimeSource, Volume, VolumeIdx};
 use capsules_core::process_console::Command;
-use embedded_sdmmc::{BlockDevice, Controller, Directory, File, TimeSource, Volume, VolumeIdx};
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil;
 use kernel::process::Process;
@@ -65,8 +65,6 @@ struct App;
 
 const MAX_DIRS: usize = 8;
 const MAX_FILES: usize = 8;
-
-pub const FILENAME_BUFFER: &'static str = "12345678.123";
 
 /// Struct that stores the state of the Fat32 driver.
 /// Stores information about the current process that the driver is serving.
@@ -223,9 +221,8 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                         self.volume.take().map_or(Err(ErrorCode::FAIL), |volume| {
                             // Retrieve the file name from userspace.
                             let name = self.grants.enter(process_id, |app_data, kernel_data| {
-                                kernel_data
-                                    .get_readonly_processbuffer(ro_allow::FILE_NAME)
-                                    .and_then(|data| data.enter(|data| {}))
+                                // kernel_data.get_readonly_processbuffer(ro_allow::FILE_NAME)
+                                // .and_then(|data| data.enter(|data| data.cop))
                             });
 
                             let result = match controller.open_dir(&volume, &parent_dir, "asd") {
