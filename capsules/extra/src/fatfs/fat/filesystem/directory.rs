@@ -1,8 +1,8 @@
 use core::convert::TryFrom;
 
-use crate::blockdevice::BlockIdx;
-use crate::fat::{FatType, OnDiskDirEntry};
-use crate::filesystem::{Attributes, Cluster, ShortFileName, Timestamp};
+use super::super::blockdevice::BlockIdx;
+use super::super::fat::{FatType, OnDiskDirEntry};
+use super::super::filesystem::{Attributes, Cluster, ShortFileName, Timestamp};
 
 /// Represents a directory entry, which tells you about
 /// other files and directories.

@@ -1,6 +1,9 @@
 //! Directory Entry as stored on-disk
+//!
 
-use crate::{fat::FatType, Attributes, BlockIdx, Cluster, DirEntry, ShortFileName, Timestamp};
+use super::super::{
+    fat::FatType, Attributes, BlockIdx, Cluster, DirEntry, ShortFileName, Timestamp,
+};
 use byteorder::{ByteOrder, LittleEndian};
 
 /// Represents a 32-byte directory entry as stored on-disk in a directory file.
