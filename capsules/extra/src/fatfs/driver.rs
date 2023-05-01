@@ -5,22 +5,20 @@
 //! Provides a FAT32/FAT16 filesystem driver.
 //!
 //! Currently the driver can only serve one item
-
-use core::cell::Cell;
-use core::marker::PhantomData;
-
-use crate::fatfs::fat::{BlockDevice, Controller, Directory, File, TimeSource, Volume, VolumeIdx};
-use capsules_core::process_console::Command;
+use crate::fatfs::fat::{Controller, Directory, File, TimeSource, Volume};
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
-use kernel::hil;
-use kernel::process::Process;
-use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
+use kernel::processbuffer::ReadableProcessBuffer;
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{MapCell, OptionalCell, TakeCell};
 use kernel::{ErrorCode, ProcessId};
 
+use super::fat::blockdevice::AsyncBlockDevice;
+use super::fat::ControllerClient;
+
 /// Syscall driver number.
 pub const DRIVER_NUM: usize = capsules_core::driver::NUM::FatFS as usize;
+
+pub const BLOCK_SIZE: usize = 512;
 
 /// Ids for read-only allow buffers
 mod ro_allow {
@@ -66,18 +64,23 @@ struct App;
 const MAX_DIRS: usize = 8;
 const MAX_FILES: usize = 8;
 
-/// Struct that stores the state of the Fat32 driver.
-/// Stores information about the current process that the driver is serving.
-/// As well as state of the underlying device that the driver reading/writing to.
-pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
-    // fs: fatfs::FileSystem<>,
+pub enum CurrentAsyncOperation {
+    // The file system is not doing anything. Not waiting for any responses
+    // from the block device.
+    None,
+    Waiting,
+}
+
+/// A Fat file system, mounted on top of some `AsyncBlockDevice`.
+/// Can only serve 1 entity at a time (process, another driver).
+pub struct FatFs<D: AsyncBlockDevice<'static> + 'static, T: TimeSource + 'static> {
     grants: Grant<
         App,
         UpcallCount<1>,
         AllowRoCount<{ ro_allow::COUNT }>,
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
-    controller: TakeCell<'static, Controller<D, T, MAX_DIRS, MAX_FILES>>,
+    controller: TakeCell<'static, Controller<'static, D, T, MAX_DIRS, MAX_FILES>>,
 
     filename_buffer: TakeCell<'static, str>,
 
@@ -95,7 +98,11 @@ pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
     current_process: OptionalCell<ProcessId>,
 }
 
-impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
+impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> ControllerClient for FatFs<D, T> {
+    fn on_get_volume_done(&self, result: Result<Volume, super::fat::Error>) {}
+}
+
+impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> FatFs<D, T> {
     /// Checks if the process making the syscall has the ability to do so.
     /// Returns Ok() iff the process making the syscall is the one which reserved the driver.
     /// Returns Fail(ErrorCode::RESERVE) if no process has reserved the driver,
@@ -156,7 +163,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                     // No process has a reservation.
                     self.controller
                         .map(
-                            |controller| match controller.get_volume(VolumeIdx(partition_index)) {
+                            |controller| match controller.get_volume(partition_index as u32) {
                                 Ok(volume) => {
                                     self.current_process.replace(process_id);
                                     self.volume.replace(volume);
@@ -243,7 +250,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
     fn syscall_open_file() {}
 }
 
-impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
+impl<'a, D: AsyncBlockDevice<'static>, T: TimeSource> SyscallDriver for FatFs<D, T> {
     fn command(
         &self,
         command_num: usize,

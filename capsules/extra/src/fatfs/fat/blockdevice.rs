@@ -2,6 +2,8 @@
 //!
 //! Generic code for handling block devices.
 
+use kernel::ErrorCode;
+
 /// Represents a standard 512 byte block (also known as a sector). IBM PC
 /// formatted 5.25" and 3.5" floppy disks, SD/MMC cards up to 1 GiB in size
 /// and IDE/SATA Hard Drives up to about 2 TiB all have 512 byte blocks.
@@ -33,6 +35,23 @@ pub struct BlockIter {
     current: BlockIdx,
 }
 
+pub trait AsyncBlockDevice<'a> {
+    /// Schedule an async read operation of one block.
+    fn start_read(&self, block: &'static mut [u8; 512], block_idx: u32) -> Result<(), ErrorCode>;
+    /// Schedule an async write operation of one block.
+    fn start_write(&self, block: &'static [u8; 512], block_idx: u32) -> Result<(), ErrorCode>;
+    /// Returns the client who is listening for this device.
+    fn get_client(&'a self) -> Option<&'a dyn AsyncBlockDeviceClient>;
+    fn set_client(&'a self, client: &'a dyn AsyncBlockDeviceClient);
+    // /// Determine how many blocks this device can hold.
+    // fn num_blocks(&self) -> Result<u32, Error>;
+}
+
+pub trait AsyncBlockDeviceClient {
+    fn read_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>);
+    fn write_done(&mut self, block: &[u8; 512], block_idx: u32, status: Result<(), ()>);
+}
+
 /// Represents a block device - a device which can read and write blocks (or
 /// sectors). Only supports devices which are <= 2 TiB in size.
 pub trait BlockDevice {
@@ -41,12 +60,12 @@ pub trait BlockDevice {
     /// Read one or more blocks, starting at the given block index.
     fn read(
         &self,
-        blocks: &mut [Block],
-        start_block_idx: BlockIdx,
+        block: &mut [u8; 512],
+        block_idx: BlockIdx,
         reason: &str,
     ) -> Result<(), Self::Error>;
     /// Write one or more blocks, starting at the given block index.
-    fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error>;
+    fn write(&self, block: &[u8; 512], block_idx: BlockIdx) -> Result<(), Self::Error>;
     /// Determine how many blocks this device can hold.
     fn num_blocks(&self) -> Result<BlockCount, Self::Error>;
 }
