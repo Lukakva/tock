@@ -53,8 +53,23 @@ mod cmd {
     pub const CLOSE_DIR: usize = 3;
     /// Opens a file in the specified directory.
     pub const OPEN_FILE: usize = 4;
+    // Syscalls get three 32-bit numbers. 1 is for the command, and 2 arguments.
+    // Original plan was to have 1 SEEK syscall, which would require 1 number
+    // for the file descriptor and one number the type of SEEK (set, cur, end).
+    // so that would leave no space for the offset argument. SEEK_SET, CUR, END
+    // could be encoded in one of the numbers though. Offset can't be used because
+    // we might need the entire 32 bits. Fd is an option, since we won't need 32 bits
+    // because Tock is never going to support 2^32 open files. But still, that seems
+    // unnecessary when we can just have 3 different syscalls.
+    // (Which by the way, pretty much acts like "encoding" SET,CUR,END in the `command_num`).
+    /// Set the file offset to the beginning of the file (+ offset).
+    pub const SEEK_SET: usize = 5;
+    /// The file offset is set to its current location plus offset bytes.
+    pub const SEEK_CUR: usize = 6;
+    /// Seek the file position relative to the end of the file.
+    pub const SEEK_END: usize = 7;
     /// Closes a file.
-    pub const CLOSE_FILE: usize = 5;
+    pub const CLOSE_FILE: usize = 8;
 
     /// Tells the driver that the process is done using the driver.
     /// Essentially un-reserves it.
@@ -67,21 +82,23 @@ struct App;
 
 const MAX_DIRS: usize = 8;
 const MAX_FILES: usize = 8;
-pub const FILENAME_BUFFER: [u8; 11] = [0; 11];
+pub static FILENAME_BUFFER: [u8; 11] = [0; 11];
 
 /// Struct that stores the state of the Fat32 driver.
 /// Stores information about the current process that the driver is serving.
 /// As well as state of the underlying device that the driver reading/writing to.
 pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
-    // fs: fatfs::FileSystem<>,
     grants: Grant<
         App,
-        UpcallCount<1>,
+        UpcallCount<0>,
         AllowRoCount<{ ro_allow::COUNT }>,
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
+
+    /// Underlying fatfs controller.
     fatfs: TakeCell<'static, FatFs<D, T, MAX_DIRS, MAX_FILES>>,
 
+    /// Buffer used to copy the filename from userspace.
     filename_buffer: TakeCell<'static, [u8]>,
 
     // Values below keep track of userspace requests and are not part of
@@ -240,12 +257,10 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                                             // Copy the filename from the userspace.
                                             // Make sure we don't go over the userspace buffer,
                                             // as well as our local buffer.
-                                            for (i, byte) in data.iter().enumerate() {
-                                                if i >= name.len() {
-                                                    break;
-                                                }
+                                            let name_size = core::cmp::min(name.len(), data.len());
 
-                                                name[i] = byte.get();
+                                            for i in 0..name_size {
+                                                name[i] = data[i].get();
                                             }
 
                                             match fs.open_dir(volume, parent_dir, name) {
@@ -401,6 +416,36 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
             })
         })
     }
+
+    fn syscall_seek(
+        &self,
+        seek_type: usize,
+        _process_id: ProcessId,
+        file_id: usize,
+        offset: usize,
+    ) -> Result<u32, ErrorCode> {
+        self.files.map_or(Err(FAIL), |files| {
+            let file = match files.get_mut(file_id) {
+                Some(cell) => match cell {
+                    Some(file) => Ok(file),
+                    // Not in the array of open files. Not open = Closed already.
+                    None => Err(ErrorCode::ALREADY),
+                },
+                None => Err(INVAL),
+            }?; // Note the ? operator.
+
+            let result = match seek_type {
+                cmd::SEEK_SET => file.seek_from_start(offset as u32).map_err(|_| INVAL),
+                cmd::SEEK_CUR => file.seek_from_current(offset as i32).map_err(|_| INVAL),
+                cmd::SEEK_END => file.seek_from_end(offset as u32).map_err(|_| INVAL),
+                _ => Err(INVAL),
+            };
+
+            // If there's an error, pass it through, otherwise replace the empty Ok()
+            // with one containing the new offset of the file.
+            result.map(|_| file.current_offset)
+        })
+    }
 }
 
 impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
@@ -411,10 +456,8 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
         r3: usize,
         process_id: ProcessId,
     ) -> CommandReturn {
+        // r2 is mostly used by userspace to pass in the file descriptor (or dir descriptor).
         match command_num {
-            // Init syscall. Reserves the driver, if successful.
-            // Treat the `r2` value as the ID of the partition that this process
-            // wants to work with.
             cmd::INIT => match self.syscall_init(process_id, r2) {
                 Ok(_) => CommandReturn::success(),
                 Err(code) => CommandReturn::failure(code),
@@ -440,6 +483,12 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
                             Ok(id) => CommandReturn::success_u32(id),
                             Err(code) => CommandReturn::failure(code),
                         },
+                        cmd::SEEK_SET | cmd::SEEK_CUR | cmd::SEEK_END => {
+                            match self.syscall_seek(command_num, process_id, r2, r3) {
+                                Ok(new_offset) => CommandReturn::success_u32(new_offset),
+                                Err(code) => CommandReturn::failure(code),
+                            }
+                        }
                         cmd::CLOSE_FILE => match self.syscall_close_file(process_id, r2) {
                             Ok(_) => CommandReturn::success(),
                             Err(code) => CommandReturn::failure(code),
