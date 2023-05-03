@@ -5,12 +5,7 @@
 //! Provides a FAT32/FAT16 filesystem driver.
 //!
 //! Currently the driver can only serve one item
-
-use core::cell::Cell;
-use core::cmp;
-use core::marker::PhantomData;
-
-use crate::fatfs::fat::{BlockDevice, Controller, Directory, File, TimeSource, Volume, VolumeIdx};
+use crate::fatfs::fat::{BlockDevice, Directory, FatFs, File, TimeSource, Volume, VolumeIdx};
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
@@ -54,8 +49,12 @@ mod cmd {
     pub const OPEN_ROOT_DIR: usize = 1;
     /// Open a directory. Userspace should be cognisant of the open-dir limit.
     pub const OPEN_DIR: usize = 2;
+    /// Close a directory.
+    pub const CLOSE_DIR: usize = 3;
     /// Opens a file in the specified directory.
-    pub const OPEN_FILE: usize = 3;
+    pub const OPEN_FILE: usize = 4;
+    /// Closes a file.
+    pub const CLOSE_FILE: usize = 5;
 
     /// Tells the driver that the process is done using the driver.
     /// Essentially un-reserves it.
@@ -81,7 +80,7 @@ pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
         AllowRoCount<{ ro_allow::COUNT }>,
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
-    controller: TakeCell<'static, Controller<D, T, MAX_DIRS, MAX_FILES>>,
+    controller: TakeCell<'static, FatFs<D, T, MAX_DIRS, MAX_FILES>>,
 
     filename_buffer: TakeCell<'static, [u8]>,
 
@@ -207,8 +206,8 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
         // - the local filename buffer
         // - userspace filename buffer
         // and then we can finally perform the logic.
-        self.directories.map_or(Err(INVAL), |dirs| {
-            self.controller.map_or(Err(INVAL), |controller| {
+        self.directories.map_or(Err(FAIL), |dirs| {
+            self.controller.map_or(Err(FAIL), |controller| {
                 self.volume.map_or(Err(FAIL), |volume| {
                     self.filename_buffer.map_or(Err(FAIL), |name| {
                         // Retrieve the file name from userspace.
@@ -264,6 +263,29 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                             })
                             .unwrap_or(Err(RESERVE))
                     })
+                })
+            })
+        })
+    }
+
+    /// Handles the CLOSE_DIR syscall.
+    fn syscall_close_dir(&self, _process_id: ProcessId, dir_id: usize) -> Result<(), ErrorCode> {
+        self.directories.map_or(Err(FAIL), |dirs| {
+            self.controller.map_or(Err(FAIL), |controller| {
+                self.volume.map_or(Err(FAIL), |volume| {
+                    // Check if the dir exists. If it does, take it out of the memory
+                    // and replace it with None.
+                    let directory = match dirs.get_mut(dir_id) {
+                        Some(cell) => match cell.take() {
+                            Some(dir) => Ok(dir),
+                            // Not in the array of open dirs. Not open = Closed already.
+                            None => Err(ErrorCode::ALREADY),
+                        },
+                        None => Err(INVAL),
+                    }?; // Note the ? operator.
+
+                    controller.close_dir(volume, directory);
+                    Ok(())
                 })
             })
         })
@@ -360,6 +382,27 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
             })
         })
     }
+
+    /// Handles the CLOSE_FILE syscall.
+    fn syscall_close_file(&self, _process_id: ProcessId, file_id: usize) -> Result<(), ErrorCode> {
+        self.files.map_or(Err(FAIL), |files| {
+            self.controller.map_or(Err(FAIL), |controller| {
+                self.volume.map_or(Err(FAIL), |volume| {
+                    let file = match files.get_mut(file_id) {
+                        Some(cell) => match cell.take() {
+                            Some(file) => Ok(file),
+                            // Not in the array of open files. Not open = Closed already.
+                            None => Err(ErrorCode::ALREADY),
+                        },
+                        None => Err(INVAL),
+                    }?; // Note the ? operator.
+
+                    controller.close_file(volume, file);
+                    Ok(())
+                })
+            })
+        })
+    }
 }
 
 impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
@@ -391,8 +434,16 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
                             Ok(id) => CommandReturn::success_u32(id),
                             Err(code) => CommandReturn::failure(code),
                         },
+                        cmd::CLOSE_DIR => match self.syscall_close_dir(process_id, r2) {
+                            Ok(_) => CommandReturn::success(),
+                            Err(code) => CommandReturn::failure(code),
+                        },
                         cmd::OPEN_FILE => match self.syscall_open_file(process_id, r2, r3) {
                             Ok(id) => CommandReturn::success_u32(id),
+                            Err(code) => CommandReturn::failure(code),
+                        },
+                        cmd::CLOSE_FILE => match self.syscall_close_file(process_id, r2) {
+                            Ok(_) => CommandReturn::success(),
                             Err(code) => CommandReturn::failure(code),
                         },
                         _ => CommandReturn::failure(ErrorCode::NOSUPPORT),

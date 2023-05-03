@@ -78,7 +78,7 @@ where
 }
 
 mod controller;
-pub use controller::Controller;
+pub use controller::FatFs;
 
 /// Represents a partition with a filesystem within it.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
