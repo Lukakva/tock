@@ -80,7 +80,7 @@ pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
         AllowRoCount<{ ro_allow::COUNT }>,
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
-    controller: TakeCell<'static, FatFs<D, T, MAX_DIRS, MAX_FILES>>,
+    fatfs: TakeCell<'static, FatFs<D, T, MAX_DIRS, MAX_FILES>>,
 
     filename_buffer: TakeCell<'static, [u8]>,
 
@@ -119,7 +119,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
         self.current_process.clear();
         self.volume.take();
 
-        self.controller.map(|controller| {
+        self.fatfs.map(|fs| {
             self.directories.map(|dirs| {
                 for i in 0..dirs.len() {
                     dirs[i] = None;
@@ -132,7 +132,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                 }
             });
 
-            controller.reset();
+            fs.reset();
         });
     }
 
@@ -149,17 +149,15 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                 // This error means that no reservation has been made so far, so init can happen.
                 ErrorCode::RESERVE => {
                     // No process has a reservation.
-                    self.controller
-                        .map(
-                            |controller| match controller.get_volume(VolumeIdx(partition_index)) {
-                                Ok(volume) => {
-                                    self.current_process.replace(process_id);
-                                    self.volume.replace(volume);
-                                    Ok(())
-                                }
-                                Err(_err) => Err(ErrorCode::FAIL),
-                            },
-                        )
+                    self.fatfs
+                        .map(|fs| match fs.get_volume(VolumeIdx(partition_index)) {
+                            Ok(volume) => {
+                                self.current_process.replace(process_id);
+                                self.volume.replace(volume);
+                                Ok(())
+                            }
+                            Err(_err) => Err(ErrorCode::FAIL),
+                        })
                         .unwrap_or(Err(ErrorCode::FAIL))
                 }
                 // Should never happen.
@@ -177,8 +175,8 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
             }
 
             self.volume.map_or(Err(ErrorCode::FAIL), |volume| {
-                self.controller.map_or(Err(ErrorCode::FAIL), |controller| {
-                    match controller.open_root_dir(&volume) {
+                self.fatfs.map_or(Err(ErrorCode::FAIL), |fs| {
+                    match fs.open_root_dir(&volume) {
                         Ok(root_directory) => {
                             dirs[0] = Some(root_directory);
                             // Convention is to send back the file/dir descriptor (int)
@@ -201,13 +199,13 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
         // Below is the unpacking hell.
         // We need to have access to:
         // - directories
-        // - controller
+        // - fs controller
         // - current partition (volume)
         // - the local filename buffer
         // - userspace filename buffer
         // and then we can finally perform the logic.
         self.directories.map_or(Err(FAIL), |dirs| {
-            self.controller.map_or(Err(FAIL), |controller| {
+            self.fatfs.map_or(Err(FAIL), |fs| {
                 self.volume.map_or(Err(FAIL), |volume| {
                     self.filename_buffer.map_or(Err(FAIL), |name| {
                         // Retrieve the file name from userspace.
@@ -250,7 +248,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                                                 name[i] = byte.get();
                                             }
 
-                                            match controller.open_dir(volume, parent_dir, name) {
+                                            match fs.open_dir(volume, parent_dir, name) {
                                                 Ok(directory) => {
                                                     dirs[new_dir_id] = Some(directory);
                                                     Ok(new_dir_id as u32)
@@ -271,7 +269,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
     /// Handles the CLOSE_DIR syscall.
     fn syscall_close_dir(&self, _process_id: ProcessId, dir_id: usize) -> Result<(), ErrorCode> {
         self.directories.map_or(Err(FAIL), |dirs| {
-            self.controller.map_or(Err(FAIL), |controller| {
+            self.fatfs.map_or(Err(FAIL), |fs| {
                 self.volume.map_or(Err(FAIL), |volume| {
                     // Check if the dir exists. If it does, take it out of the memory
                     // and replace it with None.
@@ -284,7 +282,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                         None => Err(INVAL),
                     }?; // Note the ? operator.
 
-                    controller.close_dir(volume, directory);
+                    fs.close_dir(volume, directory);
                     Ok(())
                 })
             })
@@ -302,14 +300,14 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
         // We need to have access to:
         // - directories
         // - files
-        // - controller
+        // - fs controller
         // - current partition (volume)
         // - the local filename buffer
         // - userspace filename buffer
         // and then we can finally perform the logic.
         self.directories.map_or(Err(INVAL), |dirs| {
             self.files.map_or(Err(INVAL), |files| {
-                self.controller.map_or(Err(INVAL), |controller| {
+                self.fatfs.map_or(Err(INVAL), |fs| {
                     self.volume.map_or(Err(FAIL), |volume| {
                         self.filename_buffer.map_or(Err(FAIL), |name| {
                             // Retrieve the file name from userspace.
@@ -362,7 +360,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                                                     _ => Err(ErrorCode::INVAL),
                                                 }?;
 
-                                                match controller.open_file_in_dir(
+                                                match fs.open_file_in_dir(
                                                     volume, parent_dir, name, mode_enum,
                                                 ) {
                                                     Ok(file) => {
@@ -386,7 +384,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
     /// Handles the CLOSE_FILE syscall.
     fn syscall_close_file(&self, _process_id: ProcessId, file_id: usize) -> Result<(), ErrorCode> {
         self.files.map_or(Err(FAIL), |files| {
-            self.controller.map_or(Err(FAIL), |controller| {
+            self.fatfs.map_or(Err(FAIL), |fs| {
                 self.volume.map_or(Err(FAIL), |volume| {
                     let file = match files.get_mut(file_id) {
                         Some(cell) => match cell.take() {
@@ -397,7 +395,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                         None => Err(INVAL),
                     }?; // Note the ? operator.
 
-                    controller.close_file(volume, file);
+                    fs.close_file(volume, file);
                     Ok(())
                 })
             })
