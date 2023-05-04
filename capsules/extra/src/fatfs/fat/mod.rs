@@ -4,8 +4,6 @@ mod structure;
 pub mod blockdevice;
 pub mod fat;
 pub mod filesystem;
-// pub mod sdmmc;
-// pub mod sdmmc_proto;
 
 pub use blockdevice::{Block, BlockCount, BlockDevice, BlockIdx};
 pub use fat::FatVolume;
@@ -13,8 +11,6 @@ pub use filesystem::{
     Attributes, Cluster, DirEntry, Directory, File, FilenameError, Mode, ShortFileName, TimeSource,
     Timestamp, MAX_FILE_SIZE,
 };
-// pub use sdmmc::Error as SdMmcError;
-// pub use sdmmc::{BlockSpi, SdMmcSpi};
 
 // ****************************************************************************
 //

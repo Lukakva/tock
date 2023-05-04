@@ -34,7 +34,7 @@ mod ro_allow {
 /// Ids for read-write allow buffers
 mod rw_allow {
     /// ID of the buffer shared by the user space application which we can write to.
-    pub const BUFFER: usize = 0;
+    pub const READ_BUFFER: usize = 0;
     /// The number of allow buffers the kernel stores for this grant
     pub const COUNT: u8 = 1;
 }
@@ -68,8 +68,12 @@ mod cmd {
     pub const SEEK_CUR: usize = 6;
     /// Seek the file position relative to the end of the file.
     pub const SEEK_END: usize = 7;
+    /// Reads from the file until the buffer is filled. (Or EOF is reached).
+    pub const READ: usize = 8;
+    /// Writes the buffer to the file.
+    pub const WRITE: usize = 9;
     /// Closes a file.
-    pub const CLOSE_FILE: usize = 8;
+    pub const CLOSE_FILE: usize = 10;
 
     /// Tells the driver that the process is done using the driver.
     /// Essentially un-reserves it.
@@ -396,27 +400,7 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
         })
     }
 
-    /// Handles the CLOSE_FILE syscall.
-    fn syscall_close_file(&self, _process_id: ProcessId, file_id: usize) -> Result<(), ErrorCode> {
-        self.files.map_or(Err(FAIL), |files| {
-            self.fatfs.map_or(Err(FAIL), |fs| {
-                self.volume.map_or(Err(FAIL), |volume| {
-                    let file = match files.get_mut(file_id) {
-                        Some(cell) => match cell.take() {
-                            Some(file) => Ok(file),
-                            // Not in the array of open files. Not open = Closed already.
-                            None => Err(ErrorCode::ALREADY),
-                        },
-                        None => Err(INVAL),
-                    }?; // Note the ? operator.
-
-                    fs.close_file(volume, file);
-                    Ok(())
-                })
-            })
-        })
-    }
-
+    /// Handles the SEEK_SET, SEEK_CUR, SEEK_END syscalls.
     fn syscall_seek(
         &self,
         seek_type: usize,
@@ -444,6 +428,95 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
             // If there's an error, pass it through, otherwise replace the empty Ok()
             // with one containing the new offset of the file.
             result.map(|_| file.current_offset)
+        })
+    }
+
+    /// Handles the READ syscall.
+    fn syscall_read(&self, process_id: ProcessId, file_id: usize) -> Result<u32, ErrorCode> {
+        self.files.map_or(Err(INVAL), |files| {
+            self.fatfs.map_or(Err(INVAL), |fs| {
+                self.volume.map_or(Err(FAIL), |volume| {
+                    // Retrieve the file name from userspace.
+                    self.grants
+                        .enter(process_id, |_, kd| {
+                            kd.get_readwrite_processbuffer(rw_allow::READ_BUFFER)
+                                .and_then(|buffer| {
+                                    buffer.mut_enter(|buffer| {
+                                        // Check if the dir exists.
+                                        let file = match files.get_mut(file_id) {
+                                            Some(cell) => match cell {
+                                                Some(dir) => Ok(dir),
+                                                None => Err(INVAL),
+                                            },
+                                            None => Err(INVAL),
+                                        }?; // Note the ? operator.
+
+                                        match fs.read(volume, file, buffer) {
+                                            Ok(bytes_read) => Ok(bytes_read as u32),
+                                            Err(_err) => Err(FAIL),
+                                        }
+                                    })
+                                })
+                                .unwrap_or(Err(FAIL))
+                        })
+                        .unwrap_or(Err(RESERVE))
+                })
+            })
+        })
+    }
+
+    /// Handles the WRITE syscall.
+    fn syscall_write(&self, process_id: ProcessId, file_id: usize) -> Result<u32, ErrorCode> {
+        self.files.map_or(Err(INVAL), |files| {
+            self.fatfs.map_or(Err(INVAL), |fs| {
+                self.volume.map_or(Err(FAIL), |volume| {
+                    // Retrieve the file name from userspace.
+                    self.grants
+                        .enter(process_id, |_, kd| {
+                            kd.get_readonly_processbuffer(ro_allow::WRITE_BUFFER)
+                                .and_then(|buffer| {
+                                    buffer.enter(|buffer| {
+                                        // Check if the dir exists.
+                                        let file = match files.get_mut(file_id) {
+                                            Some(cell) => match cell {
+                                                Some(dir) => Ok(dir),
+                                                None => Err(INVAL),
+                                            },
+                                            None => Err(INVAL),
+                                        }?; // Note the ? operator.
+
+                                        match fs.write(volume, file, buffer) {
+                                            Ok(bytes_wrote) => Ok(bytes_wrote as u32),
+                                            Err(_err) => Err(FAIL),
+                                        }
+                                    })
+                                })
+                                .unwrap_or(Err(FAIL))
+                        })
+                        .unwrap_or(Err(RESERVE))
+                })
+            })
+        })
+    }
+
+    /// Handles the CLOSE_FILE syscall.
+    fn syscall_close_file(&self, _process_id: ProcessId, file_id: usize) -> Result<(), ErrorCode> {
+        self.files.map_or(Err(FAIL), |files| {
+            self.fatfs.map_or(Err(FAIL), |fs| {
+                self.volume.map_or(Err(FAIL), |volume| {
+                    let file = match files.get_mut(file_id) {
+                        Some(cell) => match cell.take() {
+                            Some(file) => Ok(file),
+                            // Not in the array of open files. Not open = Closed already.
+                            None => Err(ErrorCode::ALREADY),
+                        },
+                        None => Err(INVAL),
+                    }?; // Note the ? operator.
+
+                    fs.close_file(volume, file);
+                    Ok(())
+                })
+            })
         })
     }
 }
@@ -481,6 +554,14 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
                         },
                         cmd::OPEN_FILE => match self.syscall_open_file(process_id, r2, r3) {
                             Ok(id) => CommandReturn::success_u32(id),
+                            Err(code) => CommandReturn::failure(code),
+                        },
+                        cmd::READ => match self.syscall_read(process_id, r2) {
+                            Ok(bytes_read) => CommandReturn::success_u32(bytes_read),
+                            Err(code) => CommandReturn::failure(code),
+                        },
+                        cmd::WRITE => match self.syscall_write(process_id, r2) {
+                            Ok(bytes_wrote) => CommandReturn::success_u32(bytes_wrote),
                             Err(code) => CommandReturn::failure(code),
                         },
                         cmd::SEEK_SET | cmd::SEEK_CUR | cmd::SEEK_END => {

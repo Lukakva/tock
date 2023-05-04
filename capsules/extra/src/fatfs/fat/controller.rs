@@ -1,5 +1,6 @@
 use byteorder::{ByteOrder, LittleEndian};
 use core::convert::TryFrom;
+use kernel::processbuffer::{ReadableProcessSlice, WriteableProcessBuffer, WriteableProcessSlice};
 
 #[cfg(feature = "log")]
 use log::debug;
@@ -454,7 +455,7 @@ where
         &mut self,
         volume: &Volume,
         file: &mut File,
-        buffer: &mut [u8],
+        buffer: &WriteableProcessSlice,
     ) -> Result<usize, Error<D::Error>> {
         // Calculate which file block the current offset lies within
         // While there is more to read, read the block and copy in to the buffer.
@@ -485,7 +486,7 @@ where
         &mut self,
         volume: &mut Volume,
         file: &mut File,
-        buffer: &[u8],
+        buffer: &ReadableProcessSlice,
     ) -> Result<usize, Error<D::Error>> {
         #[cfg(feature = "defmt-log")]
         debug!(
@@ -549,9 +550,17 @@ where
                     .read(&mut blocks, block_idx, "read")
                     .map_err(Error::DeviceError)?;
             }
+
             let block = &mut blocks[0];
-            block[block_offset..block_offset + to_copy]
-                .copy_from_slice(&buffer[written..written + to_copy]);
+            match buffer.get(written..written + to_copy) {
+                Some(slice) => {
+                    slice.copy_to_slice(&mut block[block_offset..block_offset + to_copy]);
+                }
+                // We expected there to be this amount of bytes, but there aren't.
+                // This shouldn't really happen.
+                None => break,
+            };
+
             self.block_device
                 .write(&blocks, block_idx)
                 .map_err(Error::DeviceError)?;
