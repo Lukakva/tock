@@ -74,15 +74,17 @@ mod cmd {
     pub const WRITE: usize = 9;
     /// Closes a file.
     pub const CLOSE_FILE: usize = 10;
+    /// Deletes a file.
+    pub const DELETE_FILE: usize = 11;
 
     /// Tells the driver that the process is done using the driver.
     /// Essentially un-reserves it.
-    pub const DONE: usize = 8;
+    pub const DONE: usize = 32;
 }
 
 // We're not really storing anything in the Grant segment of a process.
 #[derive(Default)]
-struct App;
+pub struct App;
 
 const MAX_DIRS: usize = 8;
 const MAX_FILES: usize = 8;
@@ -120,6 +122,27 @@ pub struct FatFsDriver<D: BlockDevice + 'static, T: TimeSource + 'static> {
 }
 
 impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
+    pub fn new(
+        grants: Grant<
+            App,
+            UpcallCount<0>,
+            AllowRoCount<{ ro_allow::COUNT }>,
+            AllowRwCount<{ rw_allow::COUNT }>,
+        >,
+        fatfs: &'static mut FatFs<D, T, MAX_DIRS, MAX_FILES>,
+        filename_buffer: &'static mut [u8; 11],
+    ) -> Self {
+        Self {
+            grants,
+            fatfs: TakeCell::new(fatfs),
+            filename_buffer: TakeCell::new(filename_buffer),
+            volume: MapCell::empty(),
+            directories: MapCell::new([None; MAX_DIRS]),
+            files: MapCell::new([None; MAX_DIRS]),
+            current_process: OptionalCell::empty(),
+        }
+    }
+
     /// Checks if the process making the syscall has the ability to do so.
     /// Returns Ok() iff the process making the syscall is the one which reserved the driver.
     /// Returns Fail(ErrorCode::RESERVE) if no process has reserved the driver,
@@ -133,28 +156,6 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                 // Indicate that another process has reserved the driver.
                 false => Err(ErrorCode::BUSY),
             })
-    }
-
-    /// Resets the driver. This is done after a process is done using the driver.
-    fn reset(&self) {
-        self.current_process.clear();
-        self.volume.take();
-
-        self.fatfs.map(|fs| {
-            self.directories.map(|dirs| {
-                for i in 0..dirs.len() {
-                    dirs[i] = None;
-                }
-            });
-
-            self.files.map(|files| {
-                for i in 0..files.len() {
-                    files[i] = None;
-                }
-            });
-
-            fs.reset();
-        });
     }
 
     /// Handles the INIT syscall.
@@ -185,6 +186,30 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                 code => Err(code),
             },
         }
+    }
+
+    /// Handles the DONE syscall. Resets the driver.
+    fn syscall_done(&self) -> Result<(), ErrorCode> {
+        self.current_process.clear();
+        self.volume.take();
+
+        self.fatfs.map(|fs| {
+            self.directories.map(|dirs| {
+                for i in 0..dirs.len() {
+                    dirs[i] = None;
+                }
+            });
+
+            self.files.map(|files| {
+                for i in 0..files.len() {
+                    files[i] = None;
+                }
+            });
+
+            fs.reset();
+        });
+
+        Ok(())
     }
 
     /// Opens the root directory and stores it in directory descriptor 0.
@@ -519,6 +544,27 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
             })
         })
     }
+
+    // Handles the DELETE_FILE syscall.
+    // fn syscall_delete_file(&self, _process_id: ProcessId, file_id: usize) -> Result<(), ErrorCode> {
+    //     self.files.map_or(Err(FAIL), |files| {
+    //         self.fatfs.map_or(Err(FAIL), |fs| {
+    //             self.volume.map_or(Err(FAIL), |volume| {
+    //                 let file = match files.get_mut(file_id) {
+    //                     Some(cell) => match cell.take() {
+    //                         Some(file) => Ok(file),
+    //                         // Not in the array of open files. Not open = Closed already.
+    //                         None => Err(ErrorCode::ALREADY),
+    //                     },
+    //                     None => Err(INVAL),
+    //                 }?; // Note the ? operator.
+
+    //                 fs.close_file(volume, file);
+    //                 Ok(())
+    //             })
+    //         })
+    //     })
+    // }
 }
 
 impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
@@ -556,6 +602,12 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
                             Ok(id) => CommandReturn::success_u32(id),
                             Err(code) => CommandReturn::failure(code),
                         },
+                        cmd::SEEK_SET | cmd::SEEK_CUR | cmd::SEEK_END => {
+                            match self.syscall_seek(command_num, process_id, r2, r3) {
+                                Ok(new_offset) => CommandReturn::success_u32(new_offset),
+                                Err(code) => CommandReturn::failure(code),
+                            }
+                        }
                         cmd::READ => match self.syscall_read(process_id, r2) {
                             Ok(bytes_read) => CommandReturn::success_u32(bytes_read),
                             Err(code) => CommandReturn::failure(code),
@@ -564,13 +616,11 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
                             Ok(bytes_wrote) => CommandReturn::success_u32(bytes_wrote),
                             Err(code) => CommandReturn::failure(code),
                         },
-                        cmd::SEEK_SET | cmd::SEEK_CUR | cmd::SEEK_END => {
-                            match self.syscall_seek(command_num, process_id, r2, r3) {
-                                Ok(new_offset) => CommandReturn::success_u32(new_offset),
-                                Err(code) => CommandReturn::failure(code),
-                            }
-                        }
                         cmd::CLOSE_FILE => match self.syscall_close_file(process_id, r2) {
+                            Ok(_) => CommandReturn::success(),
+                            Err(code) => CommandReturn::failure(code),
+                        },
+                        cmd::DONE => match self.syscall_done() {
                             Ok(_) => CommandReturn::success(),
                             Err(code) => CommandReturn::failure(code),
                         },

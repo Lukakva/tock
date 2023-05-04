@@ -2,7 +2,7 @@ use super::super::filesystem::{Cluster, DirEntry};
 
 /// Represents an open file on disk.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct File {
     /// The starting point of the file.
     pub(crate) starting_cluster: Cluster,

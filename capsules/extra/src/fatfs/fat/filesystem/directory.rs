@@ -7,7 +7,7 @@ use super::super::filesystem::{Attributes, Cluster, ShortFileName, Timestamp};
 /// Represents a directory entry, which tells you about
 /// other files and directories.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct DirEntry {
     /// The name of the file
     pub name: ShortFileName,
@@ -29,7 +29,7 @@ pub struct DirEntry {
 
 /// Represents an open directory on disk.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
-#[derive(Debug)]
+#[derive(Copy, Debug, Clone)]
 pub struct Directory {
     /// The starting point of the directory listing.
     pub(crate) cluster: Cluster,

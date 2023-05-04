@@ -1,7 +1,7 @@
 /// An MS-DOS 8.3 filename. 7-bit ASCII only. All lower-case is converted to
 /// upper-case by default.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub struct ShortFileName {
     pub(crate) contents: [u8; 11],
 }

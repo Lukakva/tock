@@ -1,2 +1,4 @@
-pub mod driver;
-pub mod fat;
+mod driver;
+mod fat;
+
+pub use driver::*;
