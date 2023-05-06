@@ -151,10 +151,23 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
         self.current_process
             // If no current process is set, indicate that the current calling process can
             // request to reserve the driver.
-            .map_or(Err(ErrorCode::RESERVE), |id| match id == process_id {
-                true => Ok(()),
-                // Indicate that another process has reserved the driver.
-                false => Err(ErrorCode::BUSY),
+            .map_or(Err(ErrorCode::RESERVE), |current| {
+                match current == process_id {
+                    true => Ok(()),
+                    // Another process has a reservation. What if that process is dead?
+                    false => {
+                        match self.grants.enter(*current, |_, _| ()) {
+                            // Process is alive, current requesting process has to wait.
+                            Ok(_) => Err(ErrorCode::BUSY),
+                            // Process is dead. Clear the current_process and
+                            // indicate that the requesting process should and can reserve the driver
+                            Err(_) => {
+                                self.current_process.clear();
+                                Err(ErrorCode::RESERVE)
+                            }
+                        }
+                    }
+                }
             })
     }
 
