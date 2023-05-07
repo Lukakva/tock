@@ -53,7 +53,7 @@ pub enum NUM {
     NvmStorage            = 0x50001,
     SdCard                = 0x50002,
     KVSystem              = 0x50003,
-    FatFS                 = 0x50004,
+    FatFs                 = 0x50004,
 
     // Sensors
     Temperature           = 0x60000,

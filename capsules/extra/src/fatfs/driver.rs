@@ -18,7 +18,7 @@ use kernel::{
 use super::fat::Mode;
 
 /// Syscall driver number.
-pub const DRIVER_NUM: usize = capsules_core::driver::NUM::FatFS as usize;
+pub const DRIVER_NUM: usize = capsules_core::driver::NUM::FatFs as usize;
 
 /// Ids for read-only allow buffers
 mod ro_allow {
