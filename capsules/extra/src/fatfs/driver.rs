@@ -480,10 +480,10 @@ impl<D: BlockDevice, T: TimeSource> FatFsDriver<D, T> {
                             kd.get_readwrite_processbuffer(rw_allow::READ_BUFFER)
                                 .and_then(|buffer| {
                                     buffer.mut_enter(|buffer| {
-                                        // Check if the dir exists.
+                                        // Check if the file exists.
                                         let file = match files.get_mut(file_id) {
                                             Some(cell) => match cell {
-                                                Some(dir) => Ok(dir),
+                                                Some(file) => Ok(file),
                                                 None => Err(INVAL),
                                             },
                                             None => Err(INVAL),
@@ -594,7 +594,9 @@ impl<D: BlockDevice, T: TimeSource> SyscallDriver for FatFsDriver<D, T> {
                 Ok(_) => CommandReturn::success(),
                 Err(code) => CommandReturn::failure(code),
             },
-            cmd::OPEN_DIR | cmd::OPEN_ROOT_DIR | cmd::OPEN_FILE | cmd::DONE => {
+            // All other commands. cmd::INIT is a no-op here since it's
+            // matched above too.
+            cmd::INIT..=cmd::DONE => {
                 // Otherwise, for any other syscall, there needs to be a reservation
                 // made by the process.
                 match self.has_reservation(&process_id) {
