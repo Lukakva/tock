@@ -2,9 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2023.
 
-//! Provides a FAT32/FAT16 filesystem driver.
+//! Provides a synchronous FAT32/FAT16 filesystem driver on top of a block device.
 //!
-//! Currently the driver can only serve one item
+//! Currently the driver can only serve one process at a time.
+//! Requires a `BlockDevice` trait implementation.
+//!
+//! This driver only uses the `Command` syscall, therefore is synchronous.
+//! Which might not be a great idea. It has not been tested either, due to
+//! lack of hardware. However testing and benchmarking will be done to
+//! evaluate how much time kernel has to spend being blocked in kernel mode
+//! and then an async driver will be created.
+
 use crate::fatfs::fat::{BlockDevice, Directory, FatFs, File, TimeSource, Volume, VolumeIdx};
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
